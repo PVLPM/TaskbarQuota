@@ -50,6 +50,8 @@ namespace TaskbarQuota.Taskbar
         private static readonly TopologyStabilityTracker TopologyStability = new();
         private static readonly Dictionary<IntPtr, int> MissingTaskbarObservations = new();
         private static readonly AdaptiveDisplayProviderState AdaptiveDisplayProviders = new();
+        private static IReadOnlyList<DisplayIdentity> DisplayIdentities = [];
+        private static IReadOnlyList<TaskbarWindowTarget> DisplayTargets = [];
         private static ProviderId? _lastLoggedWidgetApplyProvider;
         private static WidgetSurfaceMode _activeSurface = WidgetSurfaceMode.Taskbar;
         // Foreground hook: fires the instant Windows switches windows so the focus-follows-provider
@@ -579,7 +581,7 @@ namespace TaskbarQuota.Taskbar
             _widgetHealthTimer.Start();
         }
 
-        private static void EnsureWidgets()
+        private static void EnsureWidgets(IReadOnlyList<TaskbarWindowTarget>? confirmedTargets = null)
         {
             if (IsFloatingSurface)
                 return;
@@ -590,11 +592,15 @@ namespace TaskbarQuota.Taskbar
             _isReconcilingWidgets = true;
             try
             {
-                if (!TaskbarWindowTarget.TryFindAll(out var targets))
+                var targets = confirmedTargets;
+                if (targets is null && !TaskbarWindowTarget.TryFindAll(out targets))
                 {
                     Log.Warning("Could not enumerate Windows taskbars; keeping existing widgets until the next health check");
                     return;
                 }
+                RememberDisplayIdentities(targets);
+                if (confirmedTargets is not null || TopologyStability.Observe(GetTopologySignature(targets)))
+                    MigratePersistedDisplayKeys();
                 var targetsByHandle = targets.ToDictionary(target => target.Handle);
 
                 foreach (var pair in Widgets.ToArray())
@@ -719,15 +725,15 @@ namespace TaskbarQuota.Taskbar
             return TaskbarContentRouter.ProvidersForDisplay(
                 providers,
                 mode,
-                WidgetSettingsService.SelectedTaskbarDisplayKey,
+                ResolveDisplayKey(WidgetSettingsService.SelectedTaskbarDisplayKey) ?? string.Empty,
                 widget.DisplayKey,
                 primary,
                 available,
                 provider => displayActive == provider
                     ? widget.DisplayKey
-                    : WidgetSettingsService.GetAdaptiveProviderDisplay(provider),
+                    : ResolveDisplayKey(WidgetSettingsService.GetAdaptiveProviderDisplay(provider)),
                 WidgetSettingsService.IsProviderPinned,
-                WidgetSettingsService.GetPinnedProviderDisplay);
+                provider => ResolveDisplayKey(WidgetSettingsService.GetPinnedProviderDisplay(provider)));
         }
 
         private static ProviderId? ActiveProviderForWidget(
@@ -747,12 +753,62 @@ namespace TaskbarQuota.Taskbar
                 displayKey,
                 hwnd => User32.IsWindow(hwnd)
                     && string.Equals(
-                        TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd),
+                        TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd, DisplayTargets),
                         displayKey,
                         StringComparison.OrdinalIgnoreCase));
 
         internal static bool ShouldRemoveMissingTaskbar(int consecutiveMisses, bool hostAlive)
             => !hostAlive || consecutiveMisses >= 2;
+
+        private static void RememberDisplayIdentities(IReadOnlyList<TaskbarWindowTarget> targets)
+        {
+            DisplayTargets = targets;
+            var identities = new DisplayIdentity[targets.Count];
+            for (int i = 0; i < targets.Count; i++)
+                identities[i] = targets[i].ToIdentity();
+            DisplayIdentities = identities;
+        }
+
+        private static string? ResolveDisplayKey(string? key)
+        {
+            if (string.IsNullOrWhiteSpace(key)
+                || key == WidgetSettingsService.AllDisplaysPinDestination
+                || DisplayIdentities.Count == 0)
+            {
+                return key;
+            }
+
+            return TaskbarWindowTarget.ResolvePersistedDisplayKey(key, DisplayIdentities);
+        }
+
+        private static void MigratePersistedDisplayKeys()
+        {
+            if (DisplayIdentities.Count == 0)
+                return;
+
+            if (WidgetSettingsService.CurrentTaskbarPlacement == TaskbarPlacementMode.SelectedDisplay
+                && TaskbarWindowTarget.TryMigratePersistedKey(
+                    WidgetSettingsService.SelectedTaskbarDisplayKey,
+                    DisplayIdentities,
+                    out string selected))
+            {
+                Log.Information(
+                    $"Migrated selected taskbar display {WidgetSettingsService.SelectedTaskbarDisplayKey} -> {selected}");
+                WidgetSettingsService.ApplyTaskbarPlacement(TaskbarPlacementMode.SelectedDisplay, selected);
+            }
+
+            foreach (ProviderId provider in Enum.GetValues<ProviderId>())
+            {
+                string? pinned = WidgetSettingsService.GetPinnedProviderDisplay(provider);
+                if (pinned is null || pinned == WidgetSettingsService.AllDisplaysPinDestination)
+                    continue;
+                if (!TaskbarWindowTarget.TryMigratePersistedKey(pinned, DisplayIdentities, out string resolved))
+                    continue;
+
+                Log.Information($"Migrated pinned display for {provider}: {pinned} -> {resolved}");
+                WidgetSettingsService.SetPinnedProviderDisplay(provider, resolved);
+            }
+        }
 
         private static void OnTopologyChanged(TopologyChange change)
             => _dispatcher?.TryEnqueue(() => ScheduleTopologyRecovery(change));
@@ -815,10 +871,7 @@ namespace TaskbarQuota.Taskbar
                 return false;
             }
 
-            string signature = string.Join(
-                "|",
-                targets.Select(target => $"{target.Handle.ToInt64():X}:{target.DisplayKey}:{target.IsPrimary}"));
-            if (!TopologyStability.Observe(signature))
+            if (!TopologyStability.Observe(GetTopologySignature(targets)))
                 return false;
 
             if (_topologyForceReset)
@@ -829,7 +882,8 @@ namespace TaskbarQuota.Taskbar
                 _topologyForceReset = false;
             }
 
-            EnsureWidgets();
+            // Reconcile and migrate against the exact snapshot that passed the stability check.
+            EnsureWidgets(targets);
             SyncWidgetState();
 
             return targets.All(target =>
@@ -850,6 +904,10 @@ namespace TaskbarQuota.Taskbar
             _topologyRecoveryReason = string.Empty;
         }
 
+        private static string GetTopologySignature(IReadOnlyList<TaskbarWindowTarget> targets)
+            => string.Join("|", targets.Select(target =>
+                $"{target.Handle.ToInt64():X}:{target.DisplayKey}:{target.GdiDeviceName}:{target.IsPrimary}"));
+
         private static AgentActivitySnapshot ActivityForWidget(
             TaskBarWidget widget,
             AgentActivitySnapshot snapshot)
@@ -862,13 +920,13 @@ namespace TaskbarQuota.Taskbar
             return TaskbarContentRouter.ActivityForDisplay(
                 snapshot,
                 WidgetSettingsService.CurrentTaskbarPlacement,
-                WidgetSettingsService.SelectedTaskbarDisplayKey,
+                ResolveDisplayKey(WidgetSettingsService.SelectedTaskbarDisplayKey) ?? string.Empty,
                 widget.DisplayKey,
                 primary,
                 available,
-                WidgetSettingsService.GetAdaptiveProviderDisplay,
+                provider => ResolveDisplayKey(WidgetSettingsService.GetAdaptiveProviderDisplay(provider)),
                 WidgetSettingsService.IsProviderPinned,
-                WidgetSettingsService.GetPinnedProviderDisplay);
+                provider => ResolveDisplayKey(WidgetSettingsService.GetPinnedProviderDisplay(provider)));
         }
 
         private static void SyncWidgetState()
@@ -1172,7 +1230,7 @@ namespace TaskbarQuota.Taskbar
 
         private static void OnProviderWindowObserved(ProviderId provider, IntPtr hwnd)
         {
-            string displayKey = TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd);
+            string displayKey = TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd, DisplayTargets);
             if (displayKey.Length == 0)
                 return;
 
@@ -1186,7 +1244,7 @@ namespace TaskbarQuota.Taskbar
             if (AdaptiveDisplayProviders.GetProviderForWindow(hwnd) is not { } provider)
                 return;
 
-            string displayKey = TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd);
+            string displayKey = TaskbarWindowTarget.GetDisplayKeyForWindow(hwnd, DisplayTargets);
             if (displayKey.Length != 0)
                 RecordAdaptiveProviderDisplay(provider, displayKey, hwnd);
         }
