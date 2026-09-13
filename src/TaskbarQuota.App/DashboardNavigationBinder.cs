@@ -102,7 +102,9 @@ namespace TaskbarQuota
             bool providerIsKnown = _viewModel.Cards.Any(card => card.ProviderId == id)
                 || _viewModel.AvailableCards.Any(card => card.ProviderId == id);
             _viewModel.SelectProvider(id);
-            if (!providerIsKnown)
+            // Never auto-enable an explicitly-disabled provider from navigation —
+            // only the Settings toggle opts back in.
+            if (!providerIsKnown && !ProviderDiscoveryService.IsExplicitlyDisabled(id))
                 _viewModel.EnableAvailableProvider(id);
             return true;
         }
