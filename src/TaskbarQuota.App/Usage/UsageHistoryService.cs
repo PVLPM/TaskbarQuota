@@ -131,13 +131,27 @@ namespace TaskbarQuota.Usage
             return Aggregate(events, now, SourceNote(providerId), providerId);
         }
 
+        internal static UsageHistory BuildFromCursorDashboardEvents(
+            IEnumerable<CursorDashboardUsageEvent> dashboardEvents,
+            DateTimeOffset now)
+        {
+            var index = 0;
+            var events = dashboardEvents.Where(item => item.Tokens.TotalTokens > 0).Select(item => new UsageEvent(
+                item.Timestamp,
+                string.IsNullOrWhiteSpace(item.Model) ? "cursor-unknown" : item.Model,
+                item.Tokens,
+                item.ReportedCostUsd,
+                item.SessionId ?? string.Empty,
+                $"cursor-dashboard:{index++}"));
+            return Aggregate(events, now, "Cursor dashboard reported tokens and API-rate costs", ProviderId.Cursor);
+        }
+
         private static IEnumerable<UsageEvent> ParseFile(ProviderId providerId, string path, DateTimeOffset now)
             => providerId switch
             {
-                ProviderId.Cursor when IsCursorStateDatabase(path)
-                    => ParseCursorStateDatabase(path, now),
-                ProviderId.Antigravity when IsAntigravityTranscript(path)
-                    => ParseAntigravityTranscript(path),
+                ProviderId.Antigravity when Path.GetExtension(path).Equals(".db", StringComparison.OrdinalIgnoreCase)
+                    => AntigravityUsageDatabaseReader.Read(path).Select(item => new UsageEvent(
+                        item.Timestamp, item.Model, item.Tokens, null, item.SessionId, item.DedupeKey)),
                 ProviderId.OpenCode or ProviderId.OpenCodeGo when Path.GetExtension(path).Equals(".db", StringComparison.OrdinalIgnoreCase)
                     => ParseOpenCodeDatabase(path, providerId, now),
                 ProviderId.OpenCodeGo when Path.GetExtension(path).Equals(".jsonl", StringComparison.OrdinalIgnoreCase)
@@ -173,36 +187,34 @@ namespace TaskbarQuota.Usage
 
             if (providerId == ProviderId.Cursor)
             {
-                var cursorSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var path in CursorStateDatabaseCandidates().Where(File.Exists))
-                {
-                    if (!cursorSeen.Add(path))
-                        continue;
-                    yield return path;
-                }
+                // Cursor history is account-wide and comes from its authenticated dashboard API.
+                // A context-window snapshot in state.vscdb is not cumulative token usage.
                 yield break;
             }
 
             if (providerId == ProviderId.Antigravity)
             {
                 var antigravitySeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var oldestUsefulWrite = DateTime.UtcNow.AddDays(-91);
-                foreach (var root in AntigravityTranscriptRoots(home))
+                foreach (var root in AntigravityConversationRoots(home))
                 {
                     if (!Directory.Exists(root))
                         continue;
 
                     IEnumerable<string> files;
-                    try { files = Directory.EnumerateFiles(root, "transcript.jsonl", SearchOption.AllDirectories); }
+                    try { files = Directory.EnumerateFiles(root, "*.db", SearchOption.TopDirectoryOnly); }
                     catch (IOException) { continue; }
                     catch (UnauthorizedAccessException) { continue; }
 
                     foreach (var file in files
-                        .Where(path => LastWriteUtc(path) >= oldestUsefulWrite)
                         .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
                     {
                         if (antigravitySeen.Add(file))
+                        {
                             yield return file;
+                            foreach (var companion in SqliteCompanions(file).Where(File.Exists))
+                                if (antigravitySeen.Add(companion))
+                                    yield return companion;
+                        }
                     }
                 }
                 yield break;
@@ -387,470 +399,21 @@ namespace TaskbarQuota.Usage
             };
         }
 
-        private static IEnumerable<string> CursorStateDatabaseCandidates()
-        {
-            var configured = Environment.GetEnvironmentVariable("CURSOR_USER_DATA_DIR");
-            if (!string.IsNullOrWhiteSpace(configured))
-            {
-                yield return Path.Combine(configured.Trim(), "User", "globalStorage", "state.vscdb");
-                yield break;
-            }
-
-            yield return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                "Cursor", "User", "globalStorage", "state.vscdb");
-        }
-
-        private static IEnumerable<string> AntigravityTranscriptRoots(string home)
+        private static IEnumerable<string> AntigravityConversationRoots(string home)
         {
             var guiHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_GUI_HOME");
-            yield return Path.Combine(
-                string.IsNullOrWhiteSpace(guiHome)
-                    ? Path.Combine(home, ".gemini", "antigravity")
-                    : guiHome.Trim(),
-                "brain");
-
-            var cliHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_CLI_HOME");
-            yield return Path.Combine(
-                string.IsNullOrWhiteSpace(cliHome)
-                    ? Path.Combine(home, ".gemini", "antigravity-cli")
-                    : cliHome.Trim(),
-                "brain");
-        }
-
-        private static bool IsCursorStateDatabase(string path)
-            => Path.GetFileName(path).Equals("state.vscdb", StringComparison.OrdinalIgnoreCase);
-
-        private static bool IsAntigravityTranscript(string path)
-            => Path.GetFileName(path).Equals("transcript.jsonl", StringComparison.OrdinalIgnoreCase);
-
-        /// <summary>
-        /// Current Cursor builds store zeros in per-bubble tokenCount. The composer's context
-        /// meter (promptTokenBreakdown.totalUsedTokens / contextTokensUsed) is the locally
-        /// available input figure, so we emit one estimated input credit per conversation.
-        /// Explicit non-zero bubble tokenCount values still win for that composer.
-        /// </summary>
-        private static IReadOnlyList<UsageEvent> ParseCursorStateDatabase(string path, DateTimeOffset now)
-        {
-            var events = new List<UsageEvent>();
-            var composersWithExactTokens = new HashSet<string>(StringComparer.Ordinal);
-            var cutoff = now.AddDays(-91);
-            var cutoffMs = cutoff.ToUnixTimeMilliseconds();
-            var cutoffIso = cutoff.UtcDateTime.ToString("o", CultureInfo.InvariantCulture);
-            using var connection = OpenReadOnlyDatabase(path);
-            if (!SqliteTableExists(connection, "cursorDiskKV"))
-                return events;
-
-            using (var bubbles = connection.CreateCommand())
-            {
-                bubbles.CommandText = """
-                    SELECT key, value FROM cursorDiskKV
-                    WHERE key LIKE 'bubbleId:%'
-                      AND (
-                            (instr(value, '"inputTokens":') > 0 AND instr(value, '"inputTokens":0') = 0)
-                         OR (instr(value, '"outputTokens":') > 0 AND instr(value, '"outputTokens":0') = 0)
-                      )
-                      AND (
-                            CAST(json_extract(value, '$.lastUpdatedAt') AS INTEGER) >= $cutoffMs
-                         OR CAST(json_extract(value, '$.createdAt') AS INTEGER) >= $cutoffMs
-                         OR json_extract(value, '$.lastUpdatedAt') >= $cutoffIso
-                         OR json_extract(value, '$.createdAt') >= $cutoffIso
-                      )
-                    """;
-                bubbles.Parameters.AddWithValue("$cutoffMs", cutoffMs);
-                bubbles.Parameters.AddWithValue("$cutoffIso", cutoffIso);
-                using var reader = bubbles.ExecuteReader();
-                while (reader.Read())
-                {
-                    var key = reader.IsDBNull(0) ? "" : reader.GetString(0);
-                    var json = reader.IsDBNull(1) ? "" : reader.GetString(1);
-                    if (!TryDocument(json, out var root))
-                        continue;
-                    if (!TryReadCursorBubbleTokens(root, out var tokens))
-                        continue;
-                    var composerId = CursorComposerIdFromBubbleKey(key);
-                    if (composerId.Length > 0)
-                        composersWithExactTokens.Add(composerId);
-                    if (!TryCursorActivityTimestamp(root, out var timestamp))
-                        timestamp = now;
-                    if (timestamp < cutoff)
-                        continue;
-                    events.Add(new UsageEvent(
-                        timestamp,
-                        ReadCursorBubbleModel(root),
-                        tokens,
-                        null,
-                        composerId,
-                        key));
-                }
-            }
-
-            using (var composers = connection.CreateCommand())
-            {
-                composers.CommandText = """
-                    SELECT key, value FROM cursorDiskKV
-                    WHERE key LIKE 'composerData:%'
-                      AND (
-                            CAST(json_extract(value, '$.lastUpdatedAt') AS INTEGER) >= $cutoffMs
-                         OR CAST(json_extract(value, '$.createdAt') AS INTEGER) >= $cutoffMs
-                         OR json_extract(value, '$.lastUpdatedAt') >= $cutoffIso
-                         OR json_extract(value, '$.createdAt') >= $cutoffIso
-                      )
-                    """;
-                composers.Parameters.AddWithValue("$cutoffMs", cutoffMs);
-                composers.Parameters.AddWithValue("$cutoffIso", cutoffIso);
-                using var reader = composers.ExecuteReader();
-                while (reader.Read())
-                {
-                    var key = reader.IsDBNull(0) ? "" : reader.GetString(0);
-                    var json = reader.IsDBNull(1) ? "" : reader.GetString(1);
-                    if (!TryDocument(json, out var root))
-                        continue;
-                    var composerId = key.StartsWith("composerData:", StringComparison.Ordinal)
-                        ? key["composerData:".Length..]
-                        : key;
-                    if (composersWithExactTokens.Contains(composerId))
-                        continue;
-                    var inputTokens = ReadCursorComposerInputTokens(root);
-                    if (inputTokens == 0)
-                        continue;
-                    // Context-window snapshot: stamp with lastUpdatedAt so Today follows activity, not create day.
-                    if (!TryCursorActivityTimestamp(root, out var timestamp))
-                        continue;
-                    if (timestamp < cutoff)
-                        continue;
-                    events.Add(new UsageEvent(
-                        timestamp,
-                        ReadCursorComposerModel(root),
-                        new TokenBreakdown { Input = inputTokens },
-                        null,
-                        composerId,
-                        "cursor:composer-input:" + composerId));
-                }
-            }
-
-            return events;
-        }
-
-        private static bool TryReadCursorBubbleTokens(JsonElement root, out TokenBreakdown tokens)
-        {
-            tokens = default!;
-            if (!root.TryGetProperty("tokenCount", out var count) || count.ValueKind != JsonValueKind.Object)
-                return false;
-            var input = ReadJsonUInt64(count, "inputTokens");
-            var output = ReadJsonUInt64(count, "outputTokens");
-            if (input == 0 && output == 0)
-                return false;
-            tokens = new TokenBreakdown { Input = input, Output = output };
-            return true;
-        }
-
-        private static ulong ReadCursorComposerInputTokens(JsonElement composer)
-        {
-            if (composer.TryGetProperty("promptTokenBreakdown", out var breakdown))
-            {
-                var total = breakdown.ValueKind == JsonValueKind.Object
-                    ? ReadJsonUInt64(breakdown, "totalUsedTokens")
-                    : 0;
-                if (total == 0 && breakdown.ValueKind == JsonValueKind.String
-                    && TryDocument(breakdown.GetString() ?? "", out var parsed))
-                    total = ReadJsonUInt64(parsed, "totalUsedTokens");
-                if (total > 0)
-                    return total;
-            }
-            return ReadJsonUInt64(composer, "contextTokensUsed");
-        }
-
-        private static string ReadCursorComposerModel(JsonElement composer)
-        {
-            if (composer.TryGetProperty("modelConfig", out var config) && config.ValueKind == JsonValueKind.Object)
-            {
-                var selectedId = ReadCursorSelectedModelId(config);
-                var name = selectedId
-                    ?? ReadDirectString(config, "modelName")
-                    ?? "auto";
-                if (CursorSelectionIsFast(config) && !name.EndsWith("-fast", StringComparison.OrdinalIgnoreCase))
-                    name += "-fast";
-                return name;
-            }
-            return "auto";
-        }
-
-        private static string? ReadCursorSelectedModelId(JsonElement config)
-        {
-            if (!config.TryGetProperty("selectedModels", out var models) || models.ValueKind != JsonValueKind.Array)
-                return null;
-            foreach (var model in models.EnumerateArray())
-            {
-                if (model.ValueKind != JsonValueKind.Object)
-                    continue;
-                var id = ReadDirectString(model, "modelId");
-                if (!string.IsNullOrWhiteSpace(id))
-                    return id;
-            }
-            return null;
-        }
-
-        private static bool CursorSelectionIsFast(JsonElement config)
-        {
-            if (!config.TryGetProperty("selectedModels", out var models) || models.ValueKind != JsonValueKind.Array)
-                return false;
-            foreach (var model in models.EnumerateArray())
-            {
-                if (model.ValueKind != JsonValueKind.Object
-                    || !model.TryGetProperty("parameters", out var parameters)
-                    || parameters.ValueKind != JsonValueKind.Array)
-                    continue;
-                foreach (var parameter in parameters.EnumerateArray())
-                {
-                    if (model.ValueKind != JsonValueKind.Object)
-                        continue;
-                    if (!string.Equals(ReadDirectString(parameter, "id"), "fast", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    var value = ReadDirectString(parameter, "value");
-                    if (string.Equals(value, "true", StringComparison.OrdinalIgnoreCase))
-                        return true;
-                }
-            }
-            return false;
-        }
-
-        private static string ReadCursorBubbleModel(JsonElement root)
-        {
-            if (root.TryGetProperty("modelInfo", out var info) && info.ValueKind == JsonValueKind.Object)
-            {
-                var name = ReadDirectString(info, "modelName") ?? ReadDirectString(info, "modelId");
-                if (!string.IsNullOrWhiteSpace(name))
-                    return name;
-            }
-            return ReadCursorComposerModel(root);
-        }
-
-        private static string CursorComposerIdFromBubbleKey(string key)
-        {
-            const string prefix = "bubbleId:";
-            if (!key.StartsWith(prefix, StringComparison.Ordinal))
-                return string.Empty;
-            var rest = key[prefix.Length..];
-            var split = rest.IndexOf(':');
-            return split <= 0 ? rest : rest[..split];
-        }
-
-        private static bool TryCursorActivityTimestamp(JsonElement root, out DateTimeOffset timestamp)
-        {
-            if (TryCursorFieldTimestamp(root, "lastUpdatedAt", out timestamp))
-                return true;
-            return TryCursorFieldTimestamp(root, "createdAt", out timestamp);
-        }
-
-        private static bool TryCursorFieldTimestamp(JsonElement root, string name, out DateTimeOffset timestamp)
-        {
-            if (TryUnixTimestamp(ReadDirectInt64(root, name), out timestamp))
-                return true;
-            var text = ReadDirectString(root, name);
-            return text is not null
-                && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out timestamp);
-        }
-
-        /// <summary>
-        /// Antigravity transcripts do not record billed token counts. Visible user/planner text is
-        /// converted with the same chars/4 estimate used for Cursor bubbles that lack tokenCount.
-        /// </summary>
-        private static IReadOnlyList<UsageEvent> ParseAntigravityTranscript(string path)
-        {
-            var events = new List<UsageEvent>();
-            var sessionId = AntigravitySessionIdFromTranscriptPath(path);
-            var fallbackModel = ResolveAntigravitySessionModel(sessionId);
-            var index = 0;
-            foreach (var line in ReadSharedLines(path))
-            {
-                index++;
-                if (!TryDocument(line, out var root))
-                    continue;
-                var type = ReadDirectString(root, "type") ?? "";
-                if (!TryAntigravityTimestamp(root, out var timestamp))
-                    continue;
-                var model = NormalizeAntigravityModel(
-                    ReadDirectString(root, "model")
-                    ?? ReadDirectString(root, "model_name")
-                    ?? fallbackModel);
-
-                if (type.Equals("USER_INPUT", StringComparison.OrdinalIgnoreCase))
-                {
-                    var tokens = EstimateTokensFromText(ReadAntigravityText(root, "content"));
-                    if (tokens == 0)
-                        continue;
-                    events.Add(new UsageEvent(
-                        timestamp,
-                        model,
-                        new TokenBreakdown { Input = tokens },
-                        null,
-                        sessionId,
-                        $"{sessionId}:user:{index}"));
-                    continue;
-                }
-
-                if (!type.Equals("PLANNER_RESPONSE", StringComparison.OrdinalIgnoreCase)
-                    && !type.Equals("AGENT_RESPONSE", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var output = EstimateTokensFromText(ReadAntigravityText(root, "content"))
-                    + EstimateTokensFromText(ReadAntigravityToolCalls(root));
-                if (output == 0)
-                    continue;
-                events.Add(new UsageEvent(
-                    timestamp,
-                    model,
-                    new TokenBreakdown { Output = output },
-                    null,
-                    sessionId,
-                    $"{sessionId}:assistant:{index}"));
-            }
-            return events;
-        }
-
-        private static string AntigravitySessionIdFromTranscriptPath(string path)
-        {
-            var directory = new FileInfo(path).Directory;
-            while (directory is not null
-                && (directory.Name.Equals("logs", StringComparison.OrdinalIgnoreCase)
-                    || directory.Name.Equals(".system_generated", StringComparison.OrdinalIgnoreCase)))
-            {
-                directory = directory.Parent;
-            }
-            return directory?.Name is { Length: > 0 } name
-                ? name
-                : Path.GetFileNameWithoutExtension(path);
-        }
-
-        private static string ResolveAntigravitySessionModel(string sessionId)
-        {
-            foreach (var root in AntigravityHomes())
-            {
-                var agentName = ReadAntigravityAgentName(root, sessionId);
-                if (!string.IsNullOrWhiteSpace(agentName))
-                    return NormalizeAntigravityModel(agentName);
-            }
-
-            return "gemini-3.7-flash";
-        }
-
-        private static IEnumerable<string> AntigravityHomes()
-        {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var guiHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_GUI_HOME");
-            yield return string.IsNullOrWhiteSpace(guiHome)
+            var guiRoot = string.IsNullOrWhiteSpace(guiHome)
                 ? Path.Combine(home, ".gemini", "antigravity")
                 : guiHome.Trim();
+            yield return guiRoot;
+            yield return Path.Combine(guiRoot, "conversations");
+
             var cliHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_CLI_HOME");
-            yield return string.IsNullOrWhiteSpace(cliHome)
+            var cliRoot = string.IsNullOrWhiteSpace(cliHome)
                 ? Path.Combine(home, ".gemini", "antigravity-cli")
                 : cliHome.Trim();
-        }
-
-        private static readonly Dictionary<string, (long WriteTicks, Dictionary<string, string> Agents)> AntigravityMetadataCache = new(StringComparer.OrdinalIgnoreCase);
-
-        private static string? ReadAntigravityAgentName(string root, string sessionId)
-        {
-            if (string.IsNullOrWhiteSpace(sessionId))
-                return null;
-            var map = LoadAntigravityMetadata(root);
-            return map.TryGetValue(sessionId, out var name) ? name : null;
-        }
-
-        private static IReadOnlyDictionary<string, string> LoadAntigravityMetadata(string root)
-        {
-            var path = Path.Combine(root, "cache", "conversation_metadata.json");
-            if (!File.Exists(path))
-                return new Dictionary<string, string>(StringComparer.Ordinal);
-            try
-            {
-                var ticks = File.GetLastWriteTimeUtc(path).Ticks;
-                if (AntigravityMetadataCache.TryGetValue(path, out var cached) && cached.WriteTicks == ticks)
-                    return cached.Agents;
-
-                var agents = new Dictionary<string, string>(StringComparer.Ordinal);
-                using var document = JsonDocument.Parse(ReadSharedText(path));
-                var conversations = document.RootElement.TryGetProperty("conversations", out var value)
-                    ? value
-                    : document.RootElement;
-                if (conversations.ValueKind == JsonValueKind.Object)
-                {
-                    foreach (var entry in conversations.EnumerateObject())
-                    {
-                        if (entry.Value.ValueKind != JsonValueKind.Object)
-                            continue;
-                        var summary = entry.Value.TryGetProperty("summary", out var summaryNode)
-                            && summaryNode.ValueKind == JsonValueKind.Object
-                            ? summaryNode
-                            : entry.Value;
-                        var name = ReadDirectString(summary, "AgentName")
-                            ?? ReadDirectString(summary, "agentName");
-                        if (!string.IsNullOrWhiteSpace(name))
-                            agents[entry.Name] = name;
-                    }
-                }
-
-                AntigravityMetadataCache[path] = (ticks, agents);
-                return agents;
-            }
-            catch (IOException) { return new Dictionary<string, string>(StringComparer.Ordinal); }
-            catch (UnauthorizedAccessException) { return new Dictionary<string, string>(StringComparer.Ordinal); }
-            catch (JsonException) { return new Dictionary<string, string>(StringComparer.Ordinal); }
-        }
-
-        private static string NormalizeAntigravityModel(string? model)
-        {
-            if (string.IsNullOrWhiteSpace(model))
-                return "gemini-3.7-flash";
-            var trimmed = model.Trim();
-            if (trimmed.StartsWith("MODEL_PLACEHOLDER", StringComparison.OrdinalIgnoreCase)
-                || trimmed.Contains("3.7", StringComparison.OrdinalIgnoreCase)
-                    && trimmed.Contains("flash", StringComparison.OrdinalIgnoreCase))
-                return "gemini-3.7-flash";
-            if (trimmed.Contains("3.6", StringComparison.OrdinalIgnoreCase)
-                && trimmed.Contains("flash", StringComparison.OrdinalIgnoreCase))
-                return "gemini-3.6-flash";
-            if (trimmed.Contains("3.5", StringComparison.OrdinalIgnoreCase)
-                && trimmed.Contains("flash", StringComparison.OrdinalIgnoreCase))
-                return "gemini-3.5-flash";
-            return trimmed;
-        }
-
-        private static string ReadAntigravityToolCalls(JsonElement root)
-        {
-            if (!root.TryGetProperty("tool_calls", out var value)
-                && !root.TryGetProperty("toolCalls", out value))
-                return string.Empty;
-            return value.ValueKind is JsonValueKind.Array or JsonValueKind.Object
-                ? value.GetRawText()
-                : string.Empty;
-        }
-
-        private static bool TryAntigravityTimestamp(JsonElement root, out DateTimeOffset timestamp)
-        {
-            if (TryFindTimestamp(root, out timestamp))
-                return true;
-            return TryUnixTimestamp(ReadDirectInt64(root, "created_at") ?? ReadDirectInt64(root, "createdAt"), out timestamp);
-        }
-
-        private static string ReadAntigravityText(JsonElement root, string name)
-        {
-            if (!root.TryGetProperty(name, out var value))
-                return string.Empty;
-            return value.ValueKind switch
-            {
-                JsonValueKind.String => value.GetString() ?? "",
-                JsonValueKind.Object or JsonValueKind.Array => value.GetRawText(),
-                _ => string.Empty,
-            };
-        }
-
-        private static ulong EstimateTokensFromText(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-                return 0;
-            return (ulong)((text.Length + 3) / 4);
+            yield return cliRoot;
+            yield return Path.Combine(cliRoot, "conversations");
         }
 
         private static bool SqliteTableExists(SqliteConnection connection, string name)
@@ -1386,7 +949,7 @@ namespace TaskbarQuota.Usage
             // Grok's local log carries no billed cost, so it is estimated from the bundled pricing
             // supplement (grok-4.5, composer-*, grok-build aliases) rather than left unpriced.
             => item.ReportedCostUsd
-                ?? PricingEngine.EstimateCostUsd(NormalizeModelName(item.Model), item.Tokens);
+                ?? PricingEngine.EstimateCostUsd(NormalizeModelName(item.Model), item.Tokens, item.Timestamp);
 
         /// <summary>
         /// T3 Code / Synara-style transcripts prefix the model id with the underlying provider id
@@ -1401,7 +964,7 @@ namespace TaskbarQuota.Usage
             => model.StartsWith("opencode-go/", StringComparison.OrdinalIgnoreCase);
 
         private static double CacheSavings(UsageEvent item)
-            => PricingEngine.EstimateCacheSavingsUsd(NormalizeModelName(item.Model), item.Tokens) ?? 0;
+            => PricingEngine.EstimateCacheSavingsUsd(NormalizeModelName(item.Model), item.Tokens, item.Timestamp) ?? 0;
 
         private static string SourceNote(ProviderId providerId) => providerId switch
         {
@@ -1409,8 +972,8 @@ namespace TaskbarQuota.Usage
             ProviderId.OpenCode or ProviderId.OpenCodeGo => $"From your {DisplayName(providerId)} database (reported cost)",
             ProviderId.Cline or ProviderId.ClinePass => $"From your {DisplayName(providerId)} sessions (reported cost)",
             ProviderId.Zai => "From your Z.ai model usage database (estimated cost)",
-            ProviderId.Cursor => "From your Cursor composer data (estimated cost)",
-            ProviderId.Antigravity => "From your Antigravity transcripts (estimated cost)",
+            ProviderId.Cursor => "Cursor dashboard reported tokens and API-rate costs",
+            ProviderId.Antigravity => "Antigravity locally recorded token counters (API-rate cost estimate)",
             _ => $"From your {DisplayName(providerId)} logs (estimated)",
         };
 

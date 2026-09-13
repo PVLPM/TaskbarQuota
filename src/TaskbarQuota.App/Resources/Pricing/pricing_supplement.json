@@ -123,6 +123,13 @@
       "cache_write_per_million": 0.75,
       "cache_read_per_million": 0.075,
       "output_per_million": 3.75
+    },
+    "gemini-3.8-flash": {
+      "$comment": "Google Gemini 3.8 Flash intro pricing through 2026-12-31. Standard after that is $1.50 input / $7.50 output. Cache read is 10% of input.",
+      "input_per_million": 0.75,
+      "cache_write_per_million": 0.75,
+      "cache_read_per_million": 0.075,
+      "output_per_million": 3.75
     }
   },
   "fast_multipliers": {
@@ -179,6 +186,9 @@
     { "pattern": "^gemini 3\\.7 flash$", "canonical": "gemini-3.7-flash" },
     { "pattern": "^3\\.7 flash$", "canonical": "gemini-3.7-flash" },
     { "pattern": "^model_placeholder_m299$", "canonical": "gemini-3.7-flash" },
+    { "pattern": "^gemini-3\\.8-flash(?:-(?:low|medium|high|tiered))?$", "canonical": "gemini-3.8-flash" },
+    { "pattern": "^gemini 3\\.8 flash(?: (?:low|medium|high))?$", "canonical": "gemini-3.8-flash" },
+    { "pattern": "^model_placeholder_m(?:318|319|320|322)$", "canonical": "gemini-3.8-flash" },
     { "pattern": "^gemini-3-pro-preview$", "canonical": "gemini-3-pro-preview" },
     { "pattern": "^gemini-3\\.1-pro$", "canonical": "gemini-3.1-pro-preview" },
     { "pattern": "^gemini-3\\.1-pro-preview$", "canonical": "gemini-3.1-pro-preview" },

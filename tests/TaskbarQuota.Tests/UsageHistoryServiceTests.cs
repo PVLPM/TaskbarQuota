@@ -371,135 +371,84 @@ namespace TaskbarQuota.Tests
         }
 
         [Fact]
-        public void CursorComposerContextMeter_CountsAsEstimatedInput()
+        public void CursorDashboardEvents_UseReportedTokenBucketsAndCost()
         {
-            var directory = CreateTemporaryDirectory();
-            try
-            {
-                var path = Path.Combine(directory, "state.vscdb");
-                var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds();
-                using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
-                {
-                    connection.Open();
-                    Execute(connection, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);");
-                    using var insert = connection.CreateCommand();
-                    insert.CommandText = "INSERT INTO cursorDiskKV VALUES ($key, $value);";
-                    insert.Parameters.AddWithValue("$key", "composerData:composer-1");
-                    insert.Parameters.AddWithValue("$value", $$"""
-                        {
-                          "createdAt": {{timestamp}},
-                          "contextTokensUsed": 10000,
-                          "modelConfig": { "modelName": "composer-2" }
-                        }
-                        """);
-                    insert.ExecuteNonQuery();
-                }
+            var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds();
+            var json = $$"""
+                {"totalUsageEventsCount":"2","usageEventsDisplay":[{
+                  "timestamp":"{{timestamp}}","model":"composer-2","composerId":"session-1",
+                  "chargedCents":"0.40",
+                  "tokenUsage":{"inputTokens":"100","outputTokens":20,"cacheWriteTokens":30,"cacheReadTokens":40,"totalCents":"0.25"}
+                },{
+                  "timestamp":"{{timestamp}}","model":"composer-2","chargedCents":"0.10"
+                }]}
+                """;
 
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Cursor, new[] { path }, now);
+            var events = CursorUsageEventsClient.ParsePageForTesting(json, out var total);
+            var history = UsageHistoryService.BuildFromCursorDashboardEvents(
+                events, new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero));
 
-                Assert.Equal(10000UL, history.Today!.Tokens);
-                Assert.Equal(10000UL, history.Today.UncachedInputTokens);
-                Assert.Equal(0UL, history.Today.OutputTokens);
-                Assert.True(history.Today.CostEstimated);
-                Assert.True(history.Today.EstimatedCostUsd > 0);
-                Assert.Equal("composer-2", history.Today.ModelBreakdown!.Models[0].Model);
-                Assert.Contains("Cursor composer", history.Today.ModelBreakdown.SourceNote, StringComparison.OrdinalIgnoreCase);
-            }
-            finally
-            {
-                Directory.Delete(directory, recursive: true);
-            }
+            Assert.Equal(2, total);
+            Assert.Equal(2, events.Count);
+            Assert.Equal(190UL, history.Today!.Tokens);
+            Assert.Equal(100UL, history.Today.UncachedInputTokens);
+            Assert.Equal(30UL, history.Today.CacheCreationTokens);
+            Assert.Equal(40UL, history.Today.CachedInputTokens);
+            Assert.Equal(20UL, history.Today.OutputTokens);
+            Assert.Equal(0.0025, history.Today.EstimatedCostUsd!.Value, 6);
+            Assert.False(history.Today.CostEstimated);
+            Assert.Equal(1, history.Today.Records);
+            Assert.Equal("composer-2", history.Today.ModelBreakdown!.Models[0].Model);
         }
 
         [Fact]
-        public void CursorComposerCredit_UsesLastUpdatedAtNotCreatedAt()
+        public void CursorPagination_RemovesOnlyProvenPageBoundaryOverlap()
         {
-            var directory = CreateTemporaryDirectory();
-            try
-            {
-                var path = Path.Combine(directory, "state.vscdb");
-                var created = new DateTimeOffset(2026, 7, 20, 10, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds();
-                var updated = new DateTimeOffset(2026, 8, 5, 11, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds();
-                using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
-                {
-                    connection.Open();
-                    Execute(connection, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);");
-                    using var insert = connection.CreateCommand();
-                    insert.CommandText = "INSERT INTO cursorDiskKV VALUES ($key, $value);";
-                    insert.Parameters.AddWithValue("$key", "composerData:composer-1");
-                    insert.Parameters.AddWithValue("$value", $$"""
-                        {
-                          "createdAt": {{created}},
-                          "lastUpdatedAt": {{updated}},
-                          "contextTokensUsed": 10000,
-                          "modelConfig": { "modelName": "composer-2" }
-                        }
-                        """);
-                    insert.ExecuteNonQuery();
-                }
+            static CursorDashboardUsageEvent Event(string signature) => new(
+                DateTimeOffset.UnixEpoch.AddDays(1), "composer-2", new TokenBreakdown { Input = 1 },
+                0, 0, null, signature);
+            IReadOnlyList<IReadOnlyList<CursorDashboardUsageEvent>> pages =
+            [
+                new[] { Event("a"), Event("b") },
+                new[] { Event("b"), Event("c") },
+            ];
 
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Cursor, new[] { path }, now);
+            var result = CursorUsageEventsClient.ReconcileBoundaryOverlap(pages, 3);
 
-                Assert.Equal(10000UL, history.Today!.Tokens);
-            }
-            finally
-            {
-                Directory.Delete(directory, recursive: true);
-            }
+            Assert.Equal(new[] { "a", "b", "c" }, result.Select(item => item.Signature));
         }
 
-        [Fact]
-        public void CursorComposerCredit_AcceptsIsoCreatedAt()
+        [Theory]
+        [InlineData("MODEL_PLACEHOLDER_M299", 1299UL, "gemini-3.7-flash")]
+        [InlineData("MODEL_PLACEHOLDER_M318", 1318UL, "gemini-3.8-flash")]
+        [InlineData("MODEL_PLACEHOLDER_M319", 1319UL, "gemini-3.8-flash")]
+        [InlineData("MODEL_PLACEHOLDER_M320", 1320UL, "gemini-3.8-flash")]
+        [InlineData("MODEL_PLACEHOLDER_M322", 1322UL, "gemini-3.8-flash")]
+        public void AntigravityDatabase_ReadsRecordedInputCacheOutputAndReasoning(
+            string placeholder,
+            ulong modelId,
+            string expectedModel)
         {
             var directory = CreateTemporaryDirectory();
             try
             {
-                var path = Path.Combine(directory, "state.vscdb");
-                using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
-                {
-                    connection.Open();
-                    Execute(connection, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);");
-                    Execute(connection,
-                        """INSERT INTO cursorDiskKV VALUES ('composerData:composer-1', '{"createdAt":"2026-08-05T10:00:00Z","contextTokensUsed":8000,"modelConfig":{"modelName":"composer-2"}}');""");
-                }
+                var path = Path.Combine(directory, "session-1.db");
+                var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);
+                CreateAntigravityDatabase(path, AntigravityGenerationBlob(
+                    placeholder, modelId, timestamp,
+                    AntigravityUsageBlob(100, 80, 20, 30, 25, 55, "response-1")));
 
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Cursor, new[] { path }, now);
+                var history = UsageHistoryService.BuildFromFilesForTesting(
+                    ProviderId.Antigravity, new[] { path }, timestamp.AddHours(2));
 
-                Assert.Equal(8000UL, history.Today!.Tokens);
-            }
-            finally
-            {
-                Directory.Delete(directory, recursive: true);
-            }
-        }
-
-        [Fact]
-        public void CursorBubbleTokens_ReplaceComposerContextCredit()
-        {
-            var directory = CreateTemporaryDirectory();
-            try
-            {
-                var path = Path.Combine(directory, "state.vscdb");
-                var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds();
-                using (var connection = new SqliteConnection($"Data Source={path};Pooling=False"))
-                {
-                    connection.Open();
-                    Execute(connection, "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);");
-                    Execute(connection,
-                        "INSERT INTO cursorDiskKV VALUES " +
-                        "('composerData:composer-1', '{\"createdAt\":" + timestamp + ",\"contextTokensUsed\":99999,\"modelConfig\":{\"modelName\":\"composer-2\"}}'), " +
-                        "('bubbleId:composer-1:bubble-1', '{\"createdAt\":\"2026-08-05T10:00:00Z\",\"tokenCount\":{\"inputTokens\":100,\"outputTokens\":20},\"modelInfo\":{\"modelName\":\"composer-2\"}}');");
-                }
-
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Cursor, new[] { path }, now);
-
-                Assert.Equal(120UL, history.Today!.Tokens);
+                Assert.Equal(230UL, history.Today!.Tokens);
                 Assert.Equal(100UL, history.Today.UncachedInputTokens);
-                Assert.Equal(20UL, history.Today.OutputTokens);
+                Assert.Equal(20UL, history.Today.CacheCreationTokens);
+                Assert.Equal(30UL, history.Today.CachedInputTokens);
+                Assert.Equal(80UL, history.Today.OutputTokens);
+                Assert.Equal(25UL, history.Today.ReasoningTokens);
+                Assert.Equal(expectedModel, history.Today.ModelBreakdown!.Models[0].Model);
+                Assert.Contains("recorded token", history.Today.ModelBreakdown.SourceNote, StringComparison.OrdinalIgnoreCase);
             }
             finally
             {
@@ -508,30 +457,23 @@ namespace TaskbarQuota.Tests
         }
 
         [Fact]
-        public void AntigravityTranscript_EstimatesTokensFromVisibleText()
+        public void AntigravityDatabase_DoesNotGuessUnknownPlaceholderModel()
         {
             var directory = CreateTemporaryDirectory();
             try
             {
-                var transcriptDirectory = Path.Combine(directory, "conv-1", ".system_generated", "logs");
-                Directory.CreateDirectory(transcriptDirectory);
-                var path = Path.Combine(transcriptDirectory, "transcript.jsonl");
-                File.WriteAllLines(path,
-                [
-                    """{"type":"USER_INPUT","created_at":"2026-08-05T10:00:00Z","content":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}""",
-                    """{"type":"PLANNER_RESPONSE","created_at":"2026-08-05T10:01:00Z","tool_calls":[{"name":"find"}]}""",
-                    """{"type":"PLANNER_RESPONSE","created_at":"2026-08-05T10:02:00Z","content":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}""",
-                ]);
+                var path = Path.Combine(directory, "session-2.db");
+                var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);
+                CreateAntigravityDatabase(path, AntigravityGenerationBlob(
+                    "MODEL_PLACEHOLDER_M777", 1777, timestamp,
+                    AntigravityUsageBlob(100, 20, 0, 0, 0, 20, "response-2")));
 
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Antigravity, new[] { path }, now);
+                var history = UsageHistoryService.BuildFromFilesForTesting(
+                    ProviderId.Antigravity, new[] { path }, timestamp.AddHours(2));
 
-                Assert.Equal(10UL, history.Today!.UncachedInputTokens);
-                Assert.True(history.Today.OutputTokens > 20);
-                Assert.True(history.Today.CostEstimated);
-                Assert.True(history.Today.EstimatedCostUsd > 0);
-                Assert.Equal("gemini-3.7-flash", history.Today.ModelBreakdown!.Models[0].Model);
-                Assert.Contains("Antigravity transcripts", history.Today.ModelBreakdown.SourceNote, StringComparison.OrdinalIgnoreCase);
+                Assert.Equal("model_placeholder_m777", history.Today!.ModelBreakdown!.Models[0].Model);
+                Assert.Null(history.Today.EstimatedCostUsd);
+                Assert.False(history.Today.EstimateComplete);
             }
             finally
             {
@@ -540,25 +482,124 @@ namespace TaskbarQuota.Tests
         }
 
         [Fact]
-        public void AntigravityTranscript_MapsLineModelPlaceholderToGemini37Flash()
+        public void AntigravityDatabase_ReadsLegacySystemPromptAndReasoningCounters()
         {
             var directory = CreateTemporaryDirectory();
             try
             {
-                var transcriptDirectory = Path.Combine(directory, "conv-2", ".system_generated", "logs");
-                Directory.CreateDirectory(transcriptDirectory);
-                var path = Path.Combine(transcriptDirectory, "transcript.jsonl");
-                File.WriteAllText(path, """{"type":"USER_INPUT","created_at":"2026-08-05T10:00:00Z","model":"MODEL_PLACEHOLDER_M299","content":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}""");
+                var path = Path.Combine(directory, "legacy.db");
+                var timestamp = new DateTimeOffset(2026, 8, 5, 10, 0, 0, TimeSpan.Zero);
+                var usage = AntigravityLegacyUsageBlob(80, 20, 30, 40, 10, "legacy-response");
+                CreateAntigravityDatabase(path, AntigravityGenerationBlob(
+                    "gemini-3.7-flash", 0, timestamp, usage));
 
-                var now = new DateTimeOffset(2026, 8, 5, 12, 0, 0, TimeSpan.Zero);
-                var history = UsageHistoryService.BuildFromFilesForTesting(ProviderId.Antigravity, new[] { path }, now);
+                var history = UsageHistoryService.BuildFromFilesForTesting(
+                    ProviderId.Antigravity, new[] { path }, timestamp.AddHours(2));
 
-                Assert.Equal("gemini-3.7-flash", history.Today!.ModelBreakdown!.Models[0].Model);
+                Assert.Equal(180UL, history.Today!.Tokens);
+                Assert.Equal(100UL, history.Today.UncachedInputTokens);
+                Assert.Equal(30UL, history.Today.CachedInputTokens);
+                Assert.Equal(50UL, history.Today.OutputTokens);
+                Assert.Equal(10UL, history.Today.ReasoningTokens);
             }
             finally
             {
                 Directory.Delete(directory, recursive: true);
             }
+        }
+
+        private static void CreateAntigravityDatabase(string path, byte[] generationBlob)
+        {
+            using var connection = new SqliteConnection($"Data Source={path};Pooling=False");
+            connection.Open();
+            Execute(connection, "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);");
+            using var command = connection.CreateCommand();
+            command.CommandText = "INSERT INTO gen_metadata (idx,data,size) VALUES (0,$data,$size)";
+            command.Parameters.AddWithValue("$data", generationBlob);
+            command.Parameters.AddWithValue("$size", generationBlob.Length);
+            command.ExecuteNonQuery();
+        }
+
+        private static byte[] AntigravityGenerationBlob(
+            string model,
+            ulong modelId,
+            DateTimeOffset timestamp,
+            byte[] usage)
+        {
+            var chat = new List<byte>();
+            ProtoVarintField(chat, 3, modelId);
+            ProtoBytesField(chat, 4, usage);
+            var time = new List<byte>();
+            ProtoVarintField(time, 1, (ulong)timestamp.ToUnixTimeSeconds());
+            ProtoVarintField(time, 2, 0);
+            var generationInfo = new List<byte>();
+            ProtoBytesField(generationInfo, 4, time.ToArray());
+            ProtoBytesField(chat, 9, generationInfo.ToArray());
+            ProtoBytesField(chat, 19, System.Text.Encoding.UTF8.GetBytes(model));
+            var root = new List<byte>();
+            ProtoBytesField(root, 1, chat.ToArray());
+            return root.ToArray();
+        }
+
+        private static byte[] AntigravityUsageBlob(
+            ulong input,
+            ulong totalOutput,
+            ulong cacheWrite,
+            ulong cacheRead,
+            ulong reasoning,
+            ulong visibleOutput,
+            string responseId)
+        {
+            var result = new List<byte>();
+            ProtoVarintField(result, 2, input);
+            ProtoVarintField(result, 3, totalOutput);
+            ProtoVarintField(result, 4, cacheWrite);
+            ProtoVarintField(result, 5, cacheRead);
+            ProtoVarintField(result, 9, reasoning);
+            ProtoVarintField(result, 10, visibleOutput);
+            ProtoBytesField(result, 11, System.Text.Encoding.UTF8.GetBytes(responseId));
+            return result.ToArray();
+        }
+
+        private static byte[] AntigravityLegacyUsageBlob(
+            ulong systemPrompt,
+            ulong newInput,
+            ulong cacheRead,
+            ulong output,
+            ulong reasoning,
+            string responseId)
+        {
+            var result = new List<byte>();
+            ProtoVarintField(result, 1, systemPrompt);
+            ProtoVarintField(result, 2, newInput);
+            ProtoVarintField(result, 5, cacheRead);
+            ProtoVarintField(result, 9, output);
+            ProtoVarintField(result, 10, reasoning);
+            ProtoBytesField(result, 11, System.Text.Encoding.UTF8.GetBytes(responseId));
+            return result.ToArray();
+        }
+
+        private static void ProtoVarintField(List<byte> output, ulong number, ulong value)
+        {
+            ProtoVarint(output, number << 3);
+            ProtoVarint(output, value);
+        }
+
+        private static void ProtoBytesField(List<byte> output, ulong number, byte[] value)
+        {
+            ProtoVarint(output, (number << 3) | 2);
+            ProtoVarint(output, (ulong)value.Length);
+            output.AddRange(value);
+        }
+
+        private static void ProtoVarint(List<byte> output, ulong value)
+        {
+            while (value >= 0x80)
+            {
+                output.Add((byte)((value & 0x7f) | 0x80));
+                value >>= 7;
+            }
+            output.Add((byte)value);
         }
 
         private static string CreateTemporaryDirectory()
