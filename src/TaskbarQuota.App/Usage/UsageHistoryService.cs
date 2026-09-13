@@ -131,9 +131,27 @@ namespace TaskbarQuota.Usage
             return Aggregate(events, now, SourceNote(providerId), providerId);
         }
 
+        internal static UsageHistory BuildFromCursorDashboardEvents(
+            IEnumerable<CursorDashboardUsageEvent> dashboardEvents,
+            DateTimeOffset now)
+        {
+            var index = 0;
+            var events = dashboardEvents.Where(item => item.Tokens.TotalTokens > 0).Select(item => new UsageEvent(
+                item.Timestamp,
+                string.IsNullOrWhiteSpace(item.Model) ? "cursor-unknown" : item.Model,
+                item.Tokens,
+                item.ReportedCostUsd,
+                item.SessionId ?? string.Empty,
+                $"cursor-dashboard:{index++}"));
+            return Aggregate(events, now, "Cursor dashboard reported tokens and API-rate costs", ProviderId.Cursor);
+        }
+
         private static IEnumerable<UsageEvent> ParseFile(ProviderId providerId, string path, DateTimeOffset now)
             => providerId switch
             {
+                ProviderId.Antigravity when Path.GetExtension(path).Equals(".db", StringComparison.OrdinalIgnoreCase)
+                    => AntigravityUsageDatabaseReader.Read(path).Select(item => new UsageEvent(
+                        item.Timestamp, item.Model, item.Tokens, null, item.SessionId, item.DedupeKey)),
                 ProviderId.OpenCode or ProviderId.OpenCodeGo when Path.GetExtension(path).Equals(".db", StringComparison.OrdinalIgnoreCase)
                     => ParseOpenCodeDatabase(path, providerId, now),
                 ProviderId.OpenCodeGo when Path.GetExtension(path).Equals(".jsonl", StringComparison.OrdinalIgnoreCase)
@@ -166,6 +184,41 @@ namespace TaskbarQuota.Usage
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             if (string.IsNullOrWhiteSpace(home))
                 yield break;
+
+            if (providerId == ProviderId.Cursor)
+            {
+                // Cursor history is account-wide and comes from its authenticated dashboard API.
+                // A context-window snapshot in state.vscdb is not cumulative token usage.
+                yield break;
+            }
+
+            if (providerId == ProviderId.Antigravity)
+            {
+                var antigravitySeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var root in AntigravityConversationRoots(home))
+                {
+                    if (!Directory.Exists(root))
+                        continue;
+
+                    IEnumerable<string> files;
+                    try { files = Directory.EnumerateFiles(root, "*.db", SearchOption.TopDirectoryOnly); }
+                    catch (IOException) { continue; }
+                    catch (UnauthorizedAccessException) { continue; }
+
+                    foreach (var file in files
+                        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (antigravitySeen.Add(file))
+                        {
+                            yield return file;
+                            foreach (var companion in SqliteCompanions(file).Where(File.Exists))
+                                if (antigravitySeen.Add(companion))
+                                    yield return companion;
+                        }
+                    }
+                }
+                yield break;
+            }
 
             if (providerId is ProviderId.OpenCode or ProviderId.OpenCodeGo)
             {
@@ -344,6 +397,48 @@ namespace TaskbarQuota.Usage
                 Path.Combine(codexHome, "sessions"),
                 Path.Combine(codexHome, "archived_sessions"),
             };
+        }
+
+        private static IEnumerable<string> AntigravityConversationRoots(string home)
+        {
+            var guiHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_GUI_HOME");
+            var guiRoot = string.IsNullOrWhiteSpace(guiHome)
+                ? Path.Combine(home, ".gemini", "antigravity")
+                : guiHome.Trim();
+            yield return guiRoot;
+            yield return Path.Combine(guiRoot, "conversations");
+
+            var cliHome = Environment.GetEnvironmentVariable("ANTIGRAVITY_CLI_HOME");
+            var cliRoot = string.IsNullOrWhiteSpace(cliHome)
+                ? Path.Combine(home, ".gemini", "antigravity-cli")
+                : cliHome.Trim();
+            yield return cliRoot;
+            yield return Path.Combine(cliRoot, "conversations");
+        }
+
+        private static bool SqliteTableExists(SqliteConnection connection, string name)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1";
+            command.Parameters.AddWithValue("$name", name);
+            return command.ExecuteScalar() is not null;
+        }
+
+        private static ulong ReadJsonUInt64(JsonElement element, string name)
+        {
+            if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var value))
+                return 0;
+            if (value.ValueKind == JsonValueKind.Number)
+            {
+                if (value.TryGetUInt64(out var number))
+                    return number;
+                if (value.TryGetDouble(out var real) && real > 0)
+                    return (ulong)real;
+            }
+            if (value.ValueKind == JsonValueKind.String
+                && ulong.TryParse(value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+                return parsed;
+            return 0;
         }
 
         private static IEnumerable<string> ReadSharedLines(string path)
@@ -854,7 +949,7 @@ namespace TaskbarQuota.Usage
             // Grok's local log carries no billed cost, so it is estimated from the bundled pricing
             // supplement (grok-4.5, composer-*, grok-build aliases) rather than left unpriced.
             => item.ReportedCostUsd
-                ?? PricingEngine.EstimateCostUsd(NormalizeModelName(item.Model), item.Tokens);
+                ?? PricingEngine.EstimateCostUsd(NormalizeModelName(item.Model), item.Tokens, item.Timestamp);
 
         /// <summary>
         /// T3 Code / Synara-style transcripts prefix the model id with the underlying provider id
@@ -869,7 +964,7 @@ namespace TaskbarQuota.Usage
             => model.StartsWith("opencode-go/", StringComparison.OrdinalIgnoreCase);
 
         private static double CacheSavings(UsageEvent item)
-            => PricingEngine.EstimateCacheSavingsUsd(NormalizeModelName(item.Model), item.Tokens) ?? 0;
+            => PricingEngine.EstimateCacheSavingsUsd(NormalizeModelName(item.Model), item.Tokens, item.Timestamp) ?? 0;
 
         private static string SourceNote(ProviderId providerId) => providerId switch
         {
@@ -877,6 +972,8 @@ namespace TaskbarQuota.Usage
             ProviderId.OpenCode or ProviderId.OpenCodeGo => $"From your {DisplayName(providerId)} database (reported cost)",
             ProviderId.Cline or ProviderId.ClinePass => $"From your {DisplayName(providerId)} sessions (reported cost)",
             ProviderId.Zai => "From your Z.ai model usage database (estimated cost)",
+            ProviderId.Cursor => "Cursor dashboard reported tokens and API-rate costs",
+            ProviderId.Antigravity => "Antigravity locally recorded token counters (API-rate cost estimate)",
             _ => $"From your {DisplayName(providerId)} logs (estimated)",
         };
 
@@ -885,6 +982,8 @@ namespace TaskbarQuota.Usage
             ProviderId.Codex => "Codex",
             ProviderId.Claude => "Claude",
             ProviderId.Grok => "Grok",
+            ProviderId.Cursor => "Cursor",
+            ProviderId.Antigravity => "Antigravity",
             ProviderId.OpenCode => "OpenCode",
             ProviderId.OpenCodeGo => "OpenCode Go",
             ProviderId.Cline => "Cline",
@@ -976,11 +1075,14 @@ namespace TaskbarQuota.Usage
                     : null;
 
         private static long? ReadDirectInt64(JsonElement element, string name)
-            => element.ValueKind == JsonValueKind.Object
-                && element.TryGetProperty(name, out var value)
-                && value.TryGetInt64(out var number)
-                    ? number
-                    : null;
+        {
+            if (element.ValueKind != JsonValueKind.Object
+                || !element.TryGetProperty(name, out var value)
+                || value.ValueKind != JsonValueKind.Number
+                || !value.TryGetInt64(out var number))
+                return null;
+            return number;
+        }
 
         private static long? ReadNestedInt64(JsonElement element, string objectName, string valueName)
             => element.ValueKind == JsonValueKind.Object

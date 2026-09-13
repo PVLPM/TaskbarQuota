@@ -70,7 +70,7 @@ The Cost page combines locally available usage across providers. It includes:
 - reported costs when available, with estimates from bundled pricing data otherwise;
 - shareable summary cards.
 
-Cost coverage depends on the data stored by each provider. TaskbarQuota labels estimated values and does not invent a cost when it lacks enough information.
+Cost coverage depends on the data exposed by each provider. Codex, Claude, Grok, OpenCode, Cline, and Z.ai are read from local logs or databases. Cursor token history and reported API-rate cost come from its authenticated account usage events. Antigravity token history comes from the recorded counters in its local conversation databases; its dollar cost remains an API-rate estimate because Antigravity does not record billed cost. TaskbarQuota leaves unknown models unpriced instead of inventing a cost.
 
 ### Dashboard and notifications
 

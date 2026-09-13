@@ -106,6 +106,8 @@ public static class PricingEngine
 
     private static readonly Dictionary<string, ModelRates> OverrideRates = LoadOverrides();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ModelRates?> ResolveCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly DateTimeOffset GeminiFlashIntroEnds = new(2027, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    private static readonly ModelRates GeminiFlashStandardRates = new(1.5, 7.5, 1.5, .15);
 
     public static ModelRates? Resolve(string modelName)
     {
@@ -117,6 +119,21 @@ public static class PricingEngine
         ModelRates? result = ResolveUncached(clean);
         ResolveCache[clean] = result;
         return result;
+    }
+
+    /// <summary>Resolves rates effective when the usage occurred, including published promotional boundaries.</summary>
+    public static ModelRates? Resolve(string modelName, DateTimeOffset pricingDate)
+    {
+        var rates = Resolve(modelName);
+        if (rates is null || pricingDate.ToUniversalTime() < GeminiFlashIntroEnds
+            || OverrideRates.ContainsKey(modelName))
+            return rates;
+        var clean = modelName.Trim();
+        return clean.Equals("gemini-3.6-flash", StringComparison.OrdinalIgnoreCase)
+            || clean.Equals("gemini-3.7-flash", StringComparison.OrdinalIgnoreCase)
+            || clean.Equals("gemini-3.8-flash", StringComparison.OrdinalIgnoreCase)
+            ? GeminiFlashStandardRates
+            : rates;
     }
 
     private static ModelRates? ResolveUncached(string modelName)
@@ -154,11 +171,17 @@ public static class PricingEngine
     public static double? EstimateCostUsd(string modelName, TokenBreakdown tokens)
         => Resolve(modelName) is { } rates ? rates.CalculateCostDollars(tokens) * (tokens.IsFast ? FastMultiplier(modelName) : 1d) : null;
 
+    public static double? EstimateCostUsd(string modelName, TokenBreakdown tokens, DateTimeOffset pricingDate)
+        => Resolve(modelName, pricingDate) is { } rates ? rates.CalculateCostDollars(tokens) * (tokens.IsFast ? FastMultiplier(modelName) : 1d) : null;
+
     public static double? EstimateCostUsd(string modelName, ulong inputTokens, ulong outputTokens)
         => Resolve(modelName) is { } rates ? rates.CalculateCostDollars(inputTokens, outputTokens) : null;
 
     public static double? EstimateCacheSavingsUsd(string modelName, TokenBreakdown tokens)
         => Resolve(modelName) is { } rates ? rates.CalculateCacheSavingsDollars(tokens) : null;
+
+    public static double? EstimateCacheSavingsUsd(string modelName, TokenBreakdown tokens, DateTimeOffset pricingDate)
+        => Resolve(modelName, pricingDate) is { } rates ? rates.CalculateCacheSavingsDollars(tokens) : null;
 
     private static double FastMultiplier(string modelName)
     {

@@ -39,7 +39,10 @@ namespace TaskbarQuota.Usage.Providers
             {
                 try
                 {
-                    return await FetchUsageWithAppTokenAsync(appAuth, ct).ConfigureAwait(false);
+                    var fetch = await FetchUsageWithAppTokenAsync(appAuth, ct).ConfigureAwait(false);
+                    if (TryResolveCookieHeader() is { } historyCookie)
+                        await TryAttachDashboardHistoryAsync(fetch.Usage, historyCookie, ct).ConfigureAwait(false);
+                    return fetch;
                 }
                 catch (ProviderException)
                 {
@@ -64,7 +67,29 @@ namespace TaskbarQuota.Usage.Providers
             using (summary)
             using (me)
             {
-                return Build(summary.RootElement, me?.RootElement);
+                var fetch = Build(summary.RootElement, me?.RootElement);
+                await TryAttachDashboardHistoryAsync(fetch.Usage, cookie, ct).ConfigureAwait(false);
+                return fetch;
+            }
+        }
+
+        private static async Task TryAttachDashboardHistoryAsync(
+            UsageSnapshot usage,
+            string cookie,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                usage.UsageHistory = await CursorUsageEventsClient.FetchHistoryAsync(
+                    cookie, DateTimeOffset.Now, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                Diagnostics.Log.Debug("Cursor dashboard history unavailable: request timed out.");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Diagnostics.Log.Debug($"Cursor dashboard history unavailable: {ex.Message}");
             }
         }
 
@@ -97,17 +122,20 @@ namespace TaskbarQuota.Usage.Providers
             }
         }
 
-        private string ResolveCookieHeader()
+        private static string ResolveCookieHeader()
+            => TryResolveCookieHeader() ?? throw new ProviderException(ProviderErrorKind.AuthRequired,
+                "No Cursor cookies found. Sign in via Edge/Chrome, or paste a cookie header in credentials.json.");
+
+        private static string? TryResolveCookieHeader()
         {
-            var manual = CredentialStore.Instance.ManualCookieHeader(Id);
+            var manual = CredentialStore.Instance.ManualCookieHeader(ProviderId.Cursor);
             if (manual != null) return manual;
             foreach (var d in CookieDomains)
             {
                 var header = CookieExtractor.GetCookieHeader(d);
                 if (!string.IsNullOrEmpty(header)) return header!;
             }
-            throw new ProviderException(ProviderErrorKind.AuthRequired,
-                "No Cursor cookies found. Sign in via Edge/Chrome, or paste a cookie header in credentials.json.");
+            return null;
         }
 
         private static async Task<JsonDocument> GetJson(string url, string cookie, CancellationToken ct)
