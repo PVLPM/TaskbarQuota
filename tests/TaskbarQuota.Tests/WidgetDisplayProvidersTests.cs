@@ -5,8 +5,8 @@ using TaskbarQuota.Usage;
 namespace TaskbarQuota.Tests;
 
 /// <summary>
-/// Ordering and capping rules for the taskbar's multi-provider tile list (issue #25): the active
-/// provider always leads, pinned providers trail it most-recently-active first, and the list never
+/// Ordering and capping rules for the taskbar's multi-provider tile list (issue #88): visible, available
+/// pins lead most-recently-active first, the active provider fills any remaining slot, and the list never
 /// exceeds the tile cap.
 /// </summary>
 public class WidgetDisplayProvidersTests
@@ -30,7 +30,7 @@ public class WidgetDisplayProvidersTests
             activityWidgetEnabled);
 
     [Fact]
-    public void ActiveProviderLeadsAndPinnedTrailInRecencyOrder()
+    public void PinnedProvidersLeadActiveInRecencyOrder()
     {
         // The scenario from the issue thread: Claude used just before Codex, Z.AI never focused.
         var result = Compute(
@@ -38,11 +38,11 @@ public class WidgetDisplayProvidersTests
             pinned: new[] { ProviderId.Claude, ProviderId.Zai },
             recent: new[] { ProviderId.Codex, ProviderId.Claude });
 
-        Assert.Equal(new[] { ProviderId.Codex, ProviderId.Claude, ProviderId.Zai }, result);
+        Assert.Equal(new[] { ProviderId.Claude, ProviderId.Zai, ProviderId.Codex }, result);
     }
 
     [Fact]
-    public void ActiveProviderLeadsEvenWhenItIsItselfPinned()
+    public void ActiveProviderIsNotDuplicatedWhenItIsPinned()
     {
         var result = Compute(
             active: ProviderId.Zai,
@@ -102,25 +102,45 @@ public class WidgetDisplayProvidersTests
     }
 
     [Fact]
-    public void NeverExceedsTheTileCap()
+    public void PinnedProvidersFillTheTileCapBeforeActiveProvider()
     {
         var result = Compute(
             active: ProviderId.Codex,
             pinned: new[] { ProviderId.Claude, ProviderId.Zai, ProviderId.Cursor, ProviderId.Grok });
 
         Assert.Equal(UsageCoordinator.MaxWidgetTiles, result.Count);
-        Assert.Equal(ProviderId.Codex, result[0]);
+        Assert.DoesNotContain(ProviderId.Codex, result);
     }
 
     [Fact]
-    public void ActivityWidgetLeavesRoomForActiveAndOnePinnedTile()
+    public void ActivityWidgetShowsTwoPinsWithoutActiveTile()
     {
         var result = Compute(
             active: ProviderId.Codex,
             pinned: new[] { ProviderId.Claude, ProviderId.Zai },
             activityWidgetEnabled: true);
 
-        Assert.Equal(new[] { ProviderId.Codex, ProviderId.Claude }, result);
+        Assert.Equal(new[] { ProviderId.Claude, ProviderId.Zai }, result);
+    }
+
+    [Fact]
+    public void OnePinLeavesOneSlotForActiveProvider()
+    {
+        var result = Compute(
+            active: ProviderId.Codex,
+            pinned: new[] { ProviderId.Claude });
+
+        Assert.Equal(new[] { ProviderId.Claude, ProviderId.Codex }, result);
+    }
+
+    [Fact]
+    public void NoPinsShowsOnlyTheActiveProvider()
+    {
+        var result = Compute(
+            active: ProviderId.Codex,
+            pinned: Array.Empty<ProviderId>());
+
+        Assert.Equal(new[] { ProviderId.Codex }, result);
     }
 
     [Fact]

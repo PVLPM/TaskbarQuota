@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using TaskbarQuota.Services;
+using TaskbarQuota.Taskbar;
 using TaskbarQuota.Usage;
 
 namespace TaskbarQuota.Tests;
@@ -8,6 +9,7 @@ namespace TaskbarQuota.Tests;
 /// Pinning is limited by one thing: whether the tiles fit the taskbar space actually measured. A pinned
 /// tile is never trimmed, so a set that would not fit has to be refused rather than rendered badly.
 /// </summary>
+[Collection(WidgetRowSettingsCollection.Name)]
 public class PinBudgetServiceTests
 {
     // Measured tile widths: a two-row provider renders around 223px, a three-row one around 405px.
@@ -118,6 +120,115 @@ public class PinBudgetServiceTests
         var dropped = PinBudgetService.SelectDrops(pinned, availableWidth: 2000, maxCount: 3);
 
         Assert.Equal(new[] { ProviderId.Zai }, dropped);
+    }
+
+    [Fact]
+    public void PerDisplayWidthsDoNotDropPinsThatFitOnTheirOwnTargets()
+    {
+        var pinned = Pinned(
+            (ProviderId.Zai, LongTile),
+            (ProviderId.Claude, ShortTile));
+        var displays = new[]
+        {
+            new PinBudgetDisplay("DISPLAY1", 500, new[] { ProviderId.Zai }),
+            new PinBudgetDisplay("DISPLAY2", 250, new[] { ProviderId.Claude }),
+        };
+
+        Assert.Empty(PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 3));
+    }
+
+    [Fact]
+    public void OverBudgetDisplayOnlyDropsPinsRoutedToThatDisplay()
+    {
+        var pinned = Pinned(
+            (ProviderId.Claude, ShortTile),
+            (ProviderId.Zai, LongTile));
+        var displays = new[]
+        {
+            new PinBudgetDisplay("DISPLAY1", 300, new[] { ProviderId.Zai }),
+            new PinBudgetDisplay("DISPLAY2", 250, new[] { ProviderId.Claude }),
+        };
+
+        Assert.Equal(
+            new[] { ProviderId.Zai },
+            PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 3));
+    }
+
+    [Fact]
+    public void UnknownDisplayWidthIsPermissive()
+    {
+        var pinned = Pinned(
+            (ProviderId.Zai, LongTile),
+            (ProviderId.Claude, ShortTile));
+        var displays = new[]
+        {
+            new PinBudgetDisplay("DISPLAY2", TaskbarSpace.UnknownWidth, new[]
+            {
+                ProviderId.Zai,
+                ProviderId.Claude,
+            }),
+        };
+
+        Assert.Empty(PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 3));
+    }
+
+    [Fact]
+    public void BudgetHysteresisRequiresThreeConsecutiveOverBudgetEvaluations()
+    {
+        var state = default(BudgetHysteresisState);
+
+        state = PinBudgetService.AdvanceBudgetHysteresis(state, "same-set", overBudget: true);
+        Assert.False(PinBudgetService.IsBudgetEvictionDue(state));
+
+        state = PinBudgetService.AdvanceBudgetHysteresis(state, "same-set", overBudget: true);
+        Assert.False(PinBudgetService.IsBudgetEvictionDue(state));
+
+        state = PinBudgetService.AdvanceBudgetHysteresis(state, "same-set", overBudget: true);
+        Assert.True(PinBudgetService.IsBudgetEvictionDue(state));
+    }
+
+    [Fact]
+    public void BudgetHysteresisResetsWhenTheConditionFitsOrTheSignatureChanges()
+    {
+        var state = new BudgetHysteresisState("same-set", 2);
+
+        state = PinBudgetService.AdvanceBudgetHysteresis(state, "same-set", overBudget: false);
+        Assert.Equal(default, state);
+
+        state = PinBudgetService.AdvanceBudgetHysteresis(state, "new-set", overBudget: true);
+        Assert.Equal(1, state.ConsecutiveOverBudget);
+    }
+
+    [Fact]
+    public void AvailableWidthIsTrackedIndependentlyForEachDisplay()
+    {
+        TaskbarSpace.ResetAvailableWidth();
+        try
+        {
+            TaskbarSpace.ReportAvailableWidth("DISPLAY1", 700, isPrimary: true);
+            TaskbarSpace.ReportAvailableWidth("DISPLAY2", 400);
+
+            Assert.True(TaskbarSpace.TryGetAvailableWidth("DISPLAY1", out int primary));
+            Assert.True(TaskbarSpace.TryGetAvailableWidth("DISPLAY2", out int secondary));
+            Assert.Equal(700, primary);
+            Assert.Equal(400, secondary);
+            Assert.Equal(700, TaskbarSpace.AvailableLogicalWidth);
+        }
+        finally
+        {
+            TaskbarSpace.ResetAvailableWidth();
+        }
+    }
+
+    [Fact]
+    public void ResetAvailableWidthClearsPerDisplayMeasurements()
+    {
+        TaskbarSpace.ReportAvailableWidth("DISPLAY1", 700, isPrimary: true);
+        TaskbarSpace.ResetAvailableWidth();
+
+        Assert.False(TaskbarSpace.TryGetAvailableWidth("DISPLAY1", out _));
+        Assert.Empty(TaskbarSpace.KnownDisplayKeys);
+        Assert.Equal(TaskbarSpace.UnknownWidth, TaskbarSpace.AvailableLogicalWidth);
     }
 
     private static List<(ProviderId, int)> Pinned(params (ProviderId, int)[] entries) => [.. entries];

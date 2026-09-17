@@ -129,16 +129,15 @@ namespace TaskbarQuota
         /// </summary>
         public const int MaxWidgetTiles = 3;
 
-        /// <summary>Effective quota-tile cap: active + two pinned tiles normally, active + one pinned with activity.</summary>
+        /// <summary>Effective quota-tile cap: three tiles normally, or two while the activity island is shown.</summary>
         public static int MaxDisplayedWidgetTiles =>
             WidgetSettingsService.ShowAgentActivityInWidget ? 2 : MaxWidgetTiles;
 
         /// <summary>
-        /// Every provider the taskbar widget should render as its own tile, left to right: the ACTIVE
-        /// provider always first, then the pinned providers (most recently active first, then enum order).
-        /// So with Claude pinned + Z.AI pinned and Codex active you get "Codex | Claude | Z.AI", and
-        /// focusing Claude re-orders to "Claude | Z.AI" + whatever else is pinned — the active provider
-        /// keeps the leading slot while the pinned tiles stay put behind it (issue #25).
+        /// Every provider the taskbar widget should render as its own tile, left to right: visible and
+        /// available PINNED providers first (most recently active first, then enum order), followed by the
+        /// active provider when a slot remains. So with Claude pinned + Z.AI pinned and Codex active you get
+        /// "Claude | Z.AI | Codex"; pins keep their slots even when the active provider changes (issue #88).
         /// With no active provider this returns only pinned providers; with neither an active nor pinned
         /// provider it is empty, so the taskbar stays clear until detection selects a provider.
         /// </summary>
@@ -164,24 +163,30 @@ namespace TaskbarQuota
             Func<ProviderId, bool> isAvailable,
             bool activityWidgetEnabled = false)
         {
-            var result = new List<ProviderId>();
-
-            // The active provider leads even when it is itself pinned — it is the one the user is looking
-            // at right now, so it gets the stable leftmost slot and the pinned tiles trail it.
-            if (present && active is { } a && isVisible(a))
-                result.Add(a);
-
             var recentIndex = new Dictionary<ProviderId, int>();
             for (int i = 0; i < recent.Count; i++)
                 recentIndex.TryAdd(recent[i], i);
 
             var pinned = ordered
-                .Where(p => isPinned(p) && isVisible(p) && isAvailable(p) && !result.Contains(p))
+                .Where(p => isPinned(p) && isVisible(p) && isAvailable(p))
                 .OrderBy(p => recentIndex.TryGetValue(p, out int index) ? index : int.MaxValue)
                 .ToList();
-            result.AddRange(pinned);
 
             int maxTiles = activityWidgetEnabled ? 2 : MaxWidgetTiles;
+            var result = new List<ProviderId>(Math.Min(maxTiles, pinned.Count + 1));
+            result.AddRange(pinned);
+
+            // Pins are an explicit request to keep a provider visible. The active tile is useful context,
+            // but it is the first thing omitted when the pin set already fills the effective cap.
+            if (result.Count < maxTiles
+                && present
+                && active is { } a
+                && isVisible(a)
+                && !result.Contains(a))
+            {
+                result.Add(a);
+            }
+
             if (result.Count > maxTiles)
                 result.RemoveRange(maxTiles, result.Count - maxTiles);
             return result;

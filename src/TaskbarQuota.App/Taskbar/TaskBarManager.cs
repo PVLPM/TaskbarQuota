@@ -564,8 +564,8 @@ namespace TaskbarQuota.Taskbar
                 RefreshPinnedTiles();
                 // The free span is only known once a widget has measured it, so a set pinned before that
                 // (or pinned when the bar was emptier) is reconciled here rather than rendering badly.
-                // EnforceBudget early-outs when neither the span nor the pinned set has moved, which is
-                // every tick but the few that follow a real change.
+                // EnforceBudget observes every tick so its hysteresis can distinguish a stable overflow from
+                // a transient geometry report.
                 Services.PinBudgetService.EnforceBudget();
                 // Re-run the tile-fit math against the gap the last position pass measured, so tiles that
                 // were trimmed off a crowded taskbar come back once there is room for them again.

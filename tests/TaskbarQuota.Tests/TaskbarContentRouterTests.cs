@@ -87,7 +87,7 @@ public class TaskbarContentRouterTests
             _ => true,
             provider => provider == ProviderId.Codex);
 
-        Assert.Equal([ProviderId.OpenCode, ProviderId.Codex], candidates);
+        Assert.Equal([ProviderId.Codex, ProviderId.OpenCode], candidates);
     }
 
     [Fact]
