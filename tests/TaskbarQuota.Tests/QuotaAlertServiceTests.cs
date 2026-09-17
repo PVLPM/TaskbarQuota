@@ -133,7 +133,7 @@ public class QuotaAlertServiceTests
     {
         using var stateDirectory = new TemporaryDirectory();
         var notifier = new FakeNotifier();
-        var settings = Settings(replenishmentEnabled: false);
+        var settings = Settings(enabled: true, replenishmentEnabled: false);
         var service = new QuotaAlertService(
             notifier,
             clock: Now,
