@@ -138,6 +138,47 @@ public class PinBudgetServiceTests
     }
 
     [Fact]
+    public void PerDisplayCapsAllowTwoPinsOnEachDisplay()
+    {
+        var pinned = Pinned(
+            (ProviderId.Claude, ShortTile),
+            (ProviderId.Codex, ShortTile),
+            (ProviderId.Cursor, ShortTile),
+            (ProviderId.Grok, ShortTile));
+        var displays = new[]
+        {
+            new PinBudgetDisplay("DISPLAY1", 1000, new[] { ProviderId.Claude, ProviderId.Codex }),
+            new PinBudgetDisplay("DISPLAY2", 1000, new[] { ProviderId.Cursor, ProviderId.Grok }),
+        };
+
+        Assert.Empty(PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 2));
+    }
+
+    [Fact]
+    public void PerDisplayCapOnlyDropsTheLeastRecentPinFromTheOverCapDisplay()
+    {
+        var pinned = Pinned(
+            (ProviderId.Cursor, ShortTile),
+            (ProviderId.Claude, ShortTile),
+            (ProviderId.Codex, ShortTile),
+            (ProviderId.Zai, ShortTile));
+        var displays = new[]
+        {
+            new PinBudgetDisplay("DISPLAY1", 1000, new[]
+            {
+                ProviderId.Claude,
+                ProviderId.Codex,
+                ProviderId.Zai,
+            }),
+            new PinBudgetDisplay("DISPLAY2", 1000, new[] { ProviderId.Cursor }),
+        };
+
+        Assert.Equal(
+            new[] { ProviderId.Claude },
+            PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 2));
+    }
+
+    [Fact]
     public void OverBudgetDisplayOnlyDropsPinsRoutedToThatDisplay()
     {
         var pinned = Pinned(
@@ -170,6 +211,22 @@ public class PinBudgetServiceTests
         };
 
         Assert.Empty(PinBudgetService.SelectDropsForDisplays(pinned, displays, maxCount: 3));
+    }
+
+    [Fact]
+    public void NoDisplayIdentityRetainsTheGlobalTileCap()
+    {
+        var pinned = Pinned(
+            (ProviderId.Zai, ShortTile),
+            (ProviderId.Claude, ShortTile),
+            (ProviderId.Codex, ShortTile));
+
+        Assert.Equal(
+            new[] { ProviderId.Zai },
+            PinBudgetService.SelectDropsForDisplays(
+                pinned,
+                Array.Empty<PinBudgetDisplay>(),
+                maxCount: 2));
     }
 
     [Fact]

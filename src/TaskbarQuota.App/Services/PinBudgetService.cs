@@ -131,11 +131,13 @@ public static class PinBudgetService
         out IReadOnlyList<DisplayBudgetCalculation> calculations)
     {
         calculations = CalculateDisplays(providers, displays);
-        if (providers.Count > maxCount)
+        if (displays.Count == 0 && providers.Count > maxCount)
             return false;
 
         foreach (var calculation in calculations)
         {
+            if (calculation.Providers.Length > maxCount)
+                return false;
             if (calculation.AvailableWidth > TaskbarSpace.UnknownWidth
                 && calculation.RequiredWidth > calculation.AvailableWidth)
             {
@@ -168,31 +170,37 @@ public static class PinBudgetService
         int maxTiles = UsageCoordinator.MaxDisplayedWidgetTiles;
         string calculationText = DescribeCalculations(calculations, candidate.Count, maxTiles);
 
-        if (pinned.Count >= maxTiles)
-        {
-            reason = $"The {surfaceNoun} can show at most {maxTiles} quota providers at once, and you already "
-                + $"have {string.Join(", ", pinned.Select(ProviderName))} pinned ({calculationText}). "
-                + $"Unpin one of those to make room for {name}.";
-            LogPinRefusal(provider, calculations, calculationText);
-            return false;
-        }
-
         if (!FitsTaskbar(candidate, displays, maxTiles))
         {
-            var blocking = calculations
+            var blockingCaps = calculations
+                .Where(calculation => calculation.Providers.Length > maxTiles)
+                .ToList();
+            var blockingWidths = calculations
                 .Where(calculation => calculation.AvailableWidth > TaskbarSpace.UnknownWidth
                     && calculation.RequiredWidth > calculation.AvailableWidth)
                 .ToList();
-            string blockedDisplays = blocking.Count == 0
-                ? string.Empty
-                : $" Blocked by {string.Join(" and ", blocking.Select(calculation => DisplayLabel(calculation.DisplayKey)))}.";
+            bool globalCapFallback = displays.Count == 0 && candidate.Count > maxTiles;
 
             LogPinRefusal(provider, calculations, calculationText);
-            reason = floating
-                ? $"There isn't room in the floating widget for {name} ({Describe(provider)}) next to "
-                  + $"{string.Join(" and ", pinned.Select(p => $"{ProviderName(p)} ({Describe(p)})"))}. "
-                  + $"{calculationText}.{blockedDisplays} Turn off some rows for {name} or for a pinned provider, or unpin one."
-                : $"There isn't room on the taskbar for {name} ({Describe(provider)}) next to "
+            if (floating || globalCapFallback)
+            {
+                reason = $"The {surfaceNoun} can show at most {maxTiles} quota providers at once, and you already "
+                    + $"have {string.Join(", ", pinned.Select(ProviderName))} pinned ({calculationText}). "
+                    + $"Unpin one of those to make room for {name}.";
+                return false;
+            }
+
+            var blocking = blockingCaps
+                .Select(calculation =>
+                    $"{DisplayLabel(calculation.DisplayKey)} ({calculation.Providers.Length}/{maxTiles} routed tiles)")
+                .Concat(blockingWidths.Select(calculation =>
+                    $"{DisplayLabel(calculation.DisplayKey)} ({calculation.RequiredWidth}px needed vs {calculation.AvailableWidth}px available)"))
+                .ToList();
+            string blockedDisplays = blocking.Count == 0
+                ? string.Empty
+                : $" Blocked by {string.Join(" and ", blocking)}.";
+
+            reason = $"There isn't room on the taskbar for {name} ({Describe(provider)}) next to "
                   + $"{string.Join(" and ", pinned.Select(p => $"{ProviderName(p)} ({Describe(p)})"))}. "
                   + $"{calculationText}.{blockedDisplays} Turn off some rows for {name} or for a pinned provider, unpin one, or set the Windows "
                   + "taskbar to left alignment — that frees up a lot more room.";
@@ -266,8 +274,9 @@ public static class PinBudgetService
             string blockingDisplays = string.Join(
                 ", ",
                 calculations
-                    .Where(calculation => calculation.AvailableWidth > TaskbarSpace.UnknownWidth
-                        && calculation.RequiredWidth > calculation.AvailableWidth)
+                    .Where(calculation => calculation.Providers.Length > UsageCoordinator.MaxDisplayedWidgetTiles
+                        || (calculation.AvailableWidth > TaskbarSpace.UnknownWidth
+                            && calculation.RequiredWidth > calculation.AvailableWidth))
                     .Select(FormatCalculationForLog));
             Diagnostics.Log.Warning(
                 $"[pin] auto-unpinned after {BudgetHysteresisEvaluationCount} consecutive over-budget evaluations: "
@@ -319,19 +328,19 @@ public static class PinBudgetService
 
         while (keeping.Count > 0 && !FitsEntries(keeping, displays, maxCount))
         {
-            bool capExceeded = keeping.Count > maxCount;
-            var widthOffenders = capExceeded
+            bool globalCapExceeded = displays.Count == 0 && keeping.Count > maxCount;
+            var budgetOffenders = globalCapExceeded
                 ? new List<ProviderId>()
-                : WidthOffendingProviders(keeping, displays);
+                : BudgetOffendingProviders(keeping, displays, maxCount);
             ProviderId? dropProvider = null;
 
-            // When width is the problem, do not sacrifice a pin routed exclusively to another display.
-            // The cap is global, so an over-cap set may still drop its least-recent pin regardless of route.
+            // When width or a per-display cap is the problem, do not sacrifice a pin routed exclusively to
+            // another display. Only the no-identity/floating fallback uses a global cap.
             foreach (var entry in pinned)
             {
                 if (!keeping.Any(kept => kept.Provider == entry.Provider))
                     continue;
-                if (capExceeded || widthOffenders.Contains(entry.Provider))
+                if (globalCapExceeded || budgetOffenders.Contains(entry.Provider))
                 {
                     dropProvider = entry.Provider;
                     break;
@@ -376,29 +385,20 @@ public static class PinBudgetService
         IReadOnlyList<PinBudgetDisplay> displays,
         int maxCount)
     {
-        if (entries.Count > maxCount)
+        if (displays.Count == 0 && entries.Count > maxCount)
             return false;
 
         foreach (var display in displays)
         {
-            if (display.AvailableWidth <= TaskbarSpace.UnknownWidth)
-                continue;
+            var routed = entries
+                .Where(entry => display.Providers.Contains(entry.Provider))
+                .ToList();
+            if (routed.Count > maxCount)
+                return false;
 
-            var widths = new List<int>();
-            foreach (var provider in display.Providers)
-            {
-                foreach (var entry in entries)
-                {
-                    if (entry.Provider == provider)
-                    {
-                        widths.Add(entry.Width);
-                        break;
-                    }
-                }
-            }
-
-            if (widths.Count > 0
-                && RowWidth(widths) + display.FitMargin > display.AvailableWidth)
+            if (display.AvailableWidth > TaskbarSpace.UnknownWidth
+                && routed.Count > 0
+                && RowWidth(routed.Select(entry => entry.Width).ToList()) + display.FitMargin > display.AvailableWidth)
             {
                 return false;
             }
@@ -407,41 +407,32 @@ public static class PinBudgetService
         return true;
     }
 
-    private static List<ProviderId> WidthOffendingProviders(
+    private static List<ProviderId> BudgetOffendingProviders(
         IReadOnlyList<(ProviderId Provider, int Width)> entries,
-        IReadOnlyList<PinBudgetDisplay> displays)
+        IReadOnlyList<PinBudgetDisplay> displays,
+        int maxCount)
     {
         var offenders = new List<ProviderId>();
         foreach (var display in displays)
         {
-            if (display.AvailableWidth <= TaskbarSpace.UnknownWidth)
-                continue;
+            var routed = entries
+                .Where(entry => display.Providers.Contains(entry.Provider))
+                .ToList();
+            bool capOver = routed.Count > maxCount;
+            bool widthOver = display.AvailableWidth > TaskbarSpace.UnknownWidth
+                && routed.Count > 0
+                && RowWidth(routed.Select(entry => entry.Width).ToList()) + display.FitMargin > display.AvailableWidth;
 
-            var widths = new List<int>();
-            foreach (var provider in display.Providers)
-            {
-                foreach (var entry in entries)
-                {
-                    if (entry.Provider == provider)
-                    {
-                        widths.Add(entry.Width);
-                        break;
-                    }
-                }
-            }
-
-            if (widths.Count == 0
-                || RowWidth(widths) + display.FitMargin <= display.AvailableWidth)
+            if (!capOver && !widthOver)
             {
                 continue;
             }
 
-            foreach (var provider in display.Providers)
+            foreach (var entry in routed)
             {
-                if (entries.Any(entry => entry.Provider == provider)
-                    && !offenders.Contains(provider))
+                if (!offenders.Contains(entry.Provider))
                 {
-                    offenders.Add(provider);
+                    offenders.Add(entry.Provider);
                 }
             }
         }
@@ -575,23 +566,22 @@ public static class PinBudgetService
         int pinCount,
         int maxTiles)
     {
-        string slots = $"slots {pinCount}/{maxTiles}";
         if (calculations.Count == 0)
-            return $"{slots}; taskbar width unknown";
+            return $"slots {pinCount}/{maxTiles}; taskbar width unknown";
 
-        return slots + "; " + string.Join("; ", calculations.Select(FormatCalculation));
+        return string.Join("; ", calculations.Select(calculation => FormatCalculation(calculation, maxTiles)));
     }
 
-    private static string FormatCalculation(DisplayBudgetCalculation calculation)
+    private static string FormatCalculation(DisplayBudgetCalculation calculation, int maxTiles)
     {
         string width = calculation.AvailableWidth <= TaskbarSpace.UnknownWidth
             ? "width unknown"
             : $"{calculation.RequiredWidth}px needed vs {calculation.AvailableWidth}px available";
-        return $"{DisplayLabel(calculation.DisplayKey)}: {calculation.Providers.Length} pinned tile(s), {width}";
+        return $"{DisplayLabel(calculation.DisplayKey)}: {calculation.Providers.Length}/{maxTiles} routed pinned tile(s), {width}";
     }
 
     private static string FormatCalculationForLog(DisplayBudgetCalculation calculation)
-        => $"{DisplayLabel(calculation.DisplayKey)} pins={calculation.Providers.Length} "
+        => $"{DisplayLabel(calculation.DisplayKey)} pins={calculation.Providers.Length}/{UsageCoordinator.MaxDisplayedWidgetTiles} "
             + $"needed={calculation.RequiredWidth} available={calculation.AvailableWidth}";
 
     private static string DisplayLabel(string displayKey)

@@ -364,7 +364,9 @@ namespace TaskbarQuota.Taskbar
                 return false;
 
             var coordinator = UsageCoordinator.Instance;
-            var providers = coordinator.WidgetDisplayProviders;
+            var providers = coordinator.WidgetDisplayProviders
+                .Take(UsageCoordinator.MaxDisplayedWidgetTiles)
+                .ToArray();
             var activity = AgentActivityService.Instance.Snapshot;
 
             _floatingWindow.SetActivitySnapshot(activity);
@@ -389,7 +391,9 @@ namespace TaskbarQuota.Taskbar
                 return;
 
             var coordinator = UsageCoordinator.Instance;
-            var providers = coordinator.WidgetDisplayProviders;
+            var providers = coordinator.WidgetDisplayProviders
+                .Take(UsageCoordinator.MaxDisplayedWidgetTiles)
+                .ToArray();
 
             bool needsFetch = false;
             foreach (var provider in providers)
@@ -733,7 +737,8 @@ namespace TaskbarQuota.Taskbar
                     ? widget.DisplayKey
                     : ResolveDisplayKey(WidgetSettingsService.GetAdaptiveProviderDisplay(provider)),
                 WidgetSettingsService.IsProviderPinned,
-                provider => ResolveDisplayKey(WidgetSettingsService.GetPinnedProviderDisplay(provider)));
+                provider => ResolveDisplayKey(WidgetSettingsService.GetPinnedProviderDisplay(provider)),
+                UsageCoordinator.MaxDisplayedWidgetTiles);
         }
 
         private static ProviderId? ActiveProviderForWidget(

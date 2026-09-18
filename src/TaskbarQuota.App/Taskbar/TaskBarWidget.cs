@@ -883,8 +883,8 @@ namespace TaskbarQuota.Taskbar
 
         /// <summary>
         /// Binds the tile slots to <paramref name="providers"/> in order (leftmost first) and re-lays out.
-        /// Providers beyond the slot pool are ignored — <see cref="UsageCoordinator.WidgetDisplayProviders"/>
-        /// already caps the list at <see cref="UsageCoordinator.MaxWidgetTiles"/>.
+        /// The coordinator supplies an ordering-only candidate list; the manager applies the effective cap
+        /// after routing each display. The slot-pool <c>Take</c> remains a final safety boundary here.
         /// </summary>
         public void SetDisplayProviders(IReadOnlyList<ProviderId> providers, ProviderId? activeProvider)
         {

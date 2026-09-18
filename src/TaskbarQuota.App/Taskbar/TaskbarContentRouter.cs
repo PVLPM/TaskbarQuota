@@ -30,6 +30,7 @@ internal static class TaskbarContentRouter
         return result;
     }
 
+    /// <summary>Returns routed providers in input order, capped for this display after routing.</summary>
     public static IReadOnlyList<ProviderId> ProvidersForDisplay(
         IReadOnlyList<ProviderId> providers,
         TaskbarPlacementMode mode,
@@ -39,7 +40,8 @@ internal static class TaskbarContentRouter
         IReadOnlySet<string> availableDisplayKeys,
         Func<ProviderId, string?> adaptiveDisplayForProvider,
         Func<ProviderId, bool> isPinned,
-        Func<ProviderId, string?> pinnedDisplayForProvider)
+        Func<ProviderId, string?> pinnedDisplayForProvider,
+        int maxCount)
         => providers
             .Where(provider => IsRoutedToDisplay(
                 provider,
@@ -51,6 +53,7 @@ internal static class TaskbarContentRouter
                 adaptiveDisplayForProvider,
                 isPinned,
                 pinnedDisplayForProvider))
+            .Take(maxCount)
             .ToArray();
 
     public static AgentActivitySnapshot ActivityForDisplay(
