@@ -153,8 +153,21 @@ public static class PinBudgetService
     /// per-display width calculations that led to a refusal, so a multi-monitor layout is diagnosable.
     /// </summary>
     public static bool CanPin(ProviderId provider, out string reason)
+        => CanPin(provider, WidgetSettingsService.GetPinnedProviderDisplay(provider), out reason);
+
+    /// <summary>
+    /// Whether <paramref name="provider"/> can be pinned at the prospective adaptive destination. The
+    /// destination must be evaluated before it is persisted; otherwise admission uses the provider's old
+    /// route and can accept or reject the pin against the wrong display.
+    /// </summary>
+    public static bool CanPin(ProviderId provider, string? prospectivePinnedDisplay, out string reason)
     {
-        if (WidgetSettingsService.IsProviderPinned(provider))
+        string? currentPinnedDisplay = WidgetSettingsService.GetPinnedProviderDisplay(provider);
+        if (WidgetSettingsService.IsProviderPinned(provider)
+            && string.Equals(
+                currentPinnedDisplay,
+                prospectivePinnedDisplay,
+                StringComparison.OrdinalIgnoreCase))
         {
             reason = string.Empty;
             return true;
@@ -164,8 +177,10 @@ public static class PinBudgetService
         string name = ProviderName(provider);
         bool floating = WidgetSettingsService.CurrentSurface == WidgetSurfaceMode.Floating;
         string surfaceNoun = floating ? "floating widget" : "taskbar";
-        var candidate = pinned.Append(provider).ToList();
-        var displays = BuildDisplayBudgets(candidate);
+        var candidate = pinned.Contains(provider)
+            ? pinned
+            : pinned.Append(provider).ToList();
+        var displays = BuildDisplayBudgets(candidate, provider, prospectivePinnedDisplay);
         var calculations = CalculateDisplays(candidate, displays);
         int maxTiles = UsageCoordinator.MaxDisplayedWidgetTiles;
         string calculationText = DescribeCalculations(calculations, candidate.Count, maxTiles);
@@ -464,7 +479,10 @@ public static class PinBudgetService
         return calculations;
     }
 
-    private static List<PinBudgetDisplay> BuildDisplayBudgets(IReadOnlyList<ProviderId> providers)
+    private static List<PinBudgetDisplay> BuildDisplayBudgets(
+        IReadOnlyList<ProviderId> providers,
+        ProviderId? prospectiveProvider = null,
+        string? prospectivePinnedDisplay = null)
     {
         if (WidgetSettingsService.CurrentSurface == WidgetSurfaceMode.Floating)
             return [];
@@ -503,7 +521,9 @@ public static class PinBudgetService
                     availableDisplays,
                     WidgetSettingsService.GetAdaptiveProviderDisplay,
                     _ => true,
-                    WidgetSettingsService.GetPinnedProviderDisplay))
+                    provider => prospectiveProvider == provider
+                        ? prospectivePinnedDisplay
+                        : WidgetSettingsService.GetPinnedProviderDisplay(provider)))
                 .ToArray();
             if (routed.Length == 0)
                 continue;

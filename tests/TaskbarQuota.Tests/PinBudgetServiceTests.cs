@@ -179,6 +179,84 @@ public class PinBudgetServiceTests
     }
 
     [Fact]
+    public void CanPinEvaluatesTheProspectiveDestinationInsteadOfTheOldRoute()
+    {
+        var providers = Enum.GetValues<ProviderId>();
+        var previousPins = providers.ToDictionary(
+            provider => provider,
+            WidgetSettingsService.IsProviderPinned);
+        var previousMode = WidgetSettingsService.CurrentTaskbarPlacement;
+        var previousSelection = WidgetSettingsService.SelectedTaskbarDisplayKey;
+        var previousAdaptiveDisplays = providers
+            .Select(provider => (Provider: provider.ToString(), Display: WidgetSettingsService.GetAdaptiveProviderDisplay(provider)))
+            .Where(pair => pair.Display is not null)
+            .ToDictionary(pair => pair.Provider, pair => pair.Display!);
+        var previousPinnedDisplays = providers
+            .Select(provider => (Provider: provider.ToString(), Display: WidgetSettingsService.GetPinnedProviderDisplay(provider)))
+            .Where(pair => pair.Display is not null)
+            .ToDictionary(pair => pair.Provider, pair => pair.Display!);
+        var previousSurface = WidgetSettingsService.CurrentSurface;
+        var previousOpacity = WidgetSettingsService.FloatingOpacity;
+
+        try
+        {
+            WidgetSettingsService.RestoreSurfaceSettingsForTesting(
+                WidgetSurfaceMode.Taskbar,
+                previousOpacity);
+            WidgetSettingsService.ResetProviderPinsForTesting();
+
+            ProviderId candidate = ProviderId.Codex;
+            int maxTiles = UsageCoordinator.MaxDisplayedWidgetTiles;
+            var existingPins = providers
+                .Where(provider => provider != candidate)
+                .Take(maxTiles)
+                .ToArray();
+            foreach (var provider in existingPins)
+                WidgetSettingsService.SetProviderPinnedForTesting(provider, true);
+
+            var pinnedDisplays = existingPins.ToDictionary(
+                provider => provider.ToString(),
+                _ => "DISPLAY2");
+            WidgetSettingsService.RestoreTaskbarPlacementForTesting(
+                TaskbarPlacementMode.Adaptive,
+                string.Empty,
+                new Dictionary<string, string> { [candidate.ToString()] = "DISPLAY1" },
+                pinnedDisplays);
+            TaskbarSpace.ResetAvailableWidth();
+            TaskbarSpace.ReportAvailableWidth("DISPLAY1", TaskbarSpace.UnknownWidth, isPrimary: true);
+            TaskbarSpace.ReportAvailableWidth("DISPLAY2", TaskbarSpace.UnknownWidth);
+
+            Assert.True(PinBudgetService.CanPin(candidate, out _));
+            Assert.False(PinBudgetService.CanPin(candidate, "DISPLAY2", out string reason));
+            Assert.Contains($"{maxTiles + 1}/{maxTiles} routed tiles", reason);
+
+            WidgetSettingsService.SetProviderPinnedForTesting(candidate, true);
+            pinnedDisplays[candidate.ToString()] = "DISPLAY1";
+            WidgetSettingsService.RestoreTaskbarPlacementForTesting(
+                TaskbarPlacementMode.Adaptive,
+                string.Empty,
+                new Dictionary<string, string> { [candidate.ToString()] = "DISPLAY1" },
+                pinnedDisplays);
+
+            Assert.True(PinBudgetService.CanPin(candidate, out _));
+            Assert.False(PinBudgetService.CanPin(candidate, "DISPLAY2", out _));
+        }
+        finally
+        {
+            WidgetSettingsService.ResetProviderPinsForTesting();
+            foreach (var pair in previousPins.Where(pair => pair.Value))
+                WidgetSettingsService.SetProviderPinnedForTesting(pair.Key, true);
+            WidgetSettingsService.RestoreTaskbarPlacementForTesting(
+                previousMode,
+                previousSelection,
+                previousAdaptiveDisplays,
+                previousPinnedDisplays);
+            WidgetSettingsService.RestoreSurfaceSettingsForTesting(previousSurface, previousOpacity);
+            TaskbarSpace.ResetAvailableWidth();
+        }
+    }
+
+    [Fact]
     public void OverBudgetDisplayOnlyDropsPinsRoutedToThatDisplay()
     {
         var pinned = Pinned(
